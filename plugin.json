@@ -14,7 +14,7 @@
   },
   "provides": {
     "sdk": "iPhoneOS16.5.sdk",
-    "signer": "ldid 2.1.5",
+    "signer": "ldid 2.1.5 + zsign",
     "packager": "zip/Payload"
   },
   "commands": [
@@ -33,6 +33,11 @@
       "usage": "./ipa build <源码目录> --name 应用名 --bundle-id com.x.y [--min-ios 16.5] [--framework UIKit] [--entitlements plist] [--icon png] [-o 输出.ipa]",
       "description": "编译 Objective-C/C 源码并产出签名后的 .ipa",
       "output": "dist/<应用名>.ipa"
+    },
+    {
+      "name": "sign",
+      "usage": "./ipa sign <输入.ipa> --p12 证书.p12 --password 密码 --mobileprovision x.mobileprovision [-o 输出.ipa]  |  ./ipa sign <输入.ipa> --adhoc",
+      "description": "用 zsign 做证书签名或 ad-hoc 重签（证书路径需 p12 带完整 Apple 证书链）"
     },
     {
       "name": "pack",

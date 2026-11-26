@@ -61,6 +61,40 @@ IPA: dist/HelloApp.ipa (8.0K)
 | `--icon` | 图标 PNG | 无 |
 | `-o` | 输出路径 | `dist/<name>.ipa` |
 
+## 签名：两条路
+
+插件产出的是 **ad-hoc（伪签名）IPA**，同时内置 `zsign` 支持**证书签名**。
+
+```bash
+# A. 证书签名（装到未越狱设备，需要真 Apple 开发者证书）
+./ipa sign dist/HelloApp.ipa \
+  --p12 cert.p12 --password 你的p12密码 \
+  --mobileprovision xxx.mobileprovision \
+  -o dist/HelloApp-cert.ipa
+
+# B. 只做 ad-hoc（越狱设备 / TrollStore 用）
+./ipa sign dist/HelloApp.ipa --adhoc -o dist/HelloApp-adhoc.ipa
+```
+
+两条路的区别：
+
+| | ad-hoc（ldid/zsign -a） | 证书签名（zsign + p12 + 描述文件） |
+|---|---|---|
+| 签名内容 | 代码页哈希（CodeDirectory），`flags=0x2(adhoc)`，**无 CMS** | CodeDirectory + CMS 签名 + 嵌入 mobileprovision |
+| 能装到 | 越狱设备、TrollStore、已信任环境 | 未越狱设备（需设备 UDID 在描述文件里，或企业证书） |
+| 上架 App Store | 不行 | 仍需 Xcode + App Store Connect 正规提交流程 |
+
+实测的 ad-hoc 签名结果：
+
+```
+Identifier=com.example.helloapp
+CodeDirectory v=20400 size=749 flags=0x2(adhoc) hashes=17+3 location=embedded
+Hash type=sha256 size=32
+CandidateCDHash sha256=804145ce9a5a9ca99618ccf4be30c1e3d871a146
+```
+
+证书签名需要 **p12 里带完整证书链**（Apple 开发者证书 + WWDR 中间证书）。用自签证书测试时 zsign 会报 `Unknown issuer hash ... no usable CA chain`，这是正常的：它必须有 Apple 签发的真证书才能生成 CMS。
+
 ### 只打包已有的 .app
 
 ```bash

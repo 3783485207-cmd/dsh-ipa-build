@@ -87,7 +87,25 @@ if [ ! -x "$LDID" ]; then
   fi
 fi
 
-# ---------- 3. iPhoneOS SDK ----------
+# ---------- 3. zsign（证书重签用） ----------
+ZSign="$TC/bin/zsign"
+if [ ! -x "$ZSign" ]; then
+  say "编译 zsign（证书签名用）"
+  if [ -d "$ROOT/vendor/zsign-master" ]; then
+    rm -rf "$TC/src/zsign-master"; cp -r "$ROOT/vendor/zsign-master" "$TC/src/"
+  else
+    curl -sSL --retry 3 -o "$TC/src/zsign.tar.gz" \
+      "${GH_MIRROR}https://github.com/zhlynn/zsign/archive/refs/heads/master.tar.gz"
+    rm -rf "$TC/src"/zsign-master; tar -xzf "$TC/src/zsign.tar.gz" -C "$TC/src"
+  fi
+  if [ -d "$TC/src/zsign-master/build/linux" ]; then
+    ( cd "$TC/src/zsign-master/build/linux" && make -j"$(nproc)" >/dev/null 2>&1 \
+      && cp ../../bin/zsign "$ZSign" ) || true
+  fi
+fi
+if [ -x "$ZSign" ]; then ok "zsign 就绪：$ZSign"; else warn "zsign 未构建成功：证书签名不可用，伪签名不受影响"; fi
+
+# ---------- 4. iPhoneOS SDK ----------
 if [ ! -d "$SDK_DIR" ]; then
   say "安装 iPhoneOS SDK"
   tarball="${1:-}"
@@ -103,11 +121,12 @@ fi
 [ -d "$SDK_DIR" ] || { warn "SDK 解压后目录名不是 iPhoneOS16.5.sdk，请检查"; exit 1; }
 ok "SDK：$SDK_DIR"
 
-# ---------- 4. 写入环境文件 ----------
+# ---------- 5. 写入环境文件 ----------
 cat > "$TC/env.sh" <<EOF
 export IPA_HOME="$TC"
 export IPA_SDK="$SDK_DIR"
 export IPA_LDID="$LDID"
+export IPA_ZSIGN="$ZSign"
 export DYLD_LIBRARY_PATH="$TC/deps/lib:\${DYLD_LIBRARY_PATH:-}"
 export LD_LIBRARY_PATH="$TC/deps/lib:\${LD_LIBRARY_PATH:-}"
 EOF

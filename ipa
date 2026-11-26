@@ -4,6 +4,7 @@
 #   ./ipa install-sdk <sdk.tar.xz>  安装 / 替换 iOS SDK
 #   ./ipa build <源码目录> [选项]    编译源码并产出 .ipa
 #   ./ipa pack <已有.app目录> [-o 输出.ipa]  把现成 .app 打包成 .ipa
+#   ./ipa sign <ipa> --p12 证书.p12 --mobileprovision x.mobileprovision  证书签名（或 --adhoc 只做伪签名）
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -150,12 +151,54 @@ PY
   unzip -l "$out" | tail -n +4 | head -8
 }
 
+# ---- 证书签名 / ad-hoc 重签（zsign）----
+cmd_sign() {
+  local in="${1:-}"; shift || true
+  local p12="" pass="" prov="" out="" adhoc=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --p12|-k) p12="$2"; shift 2;;
+      --password|-p) pass="$2"; shift 2;;
+      --mobileprovision|-m) prov="$2"; shift 2;;
+      --adhoc|-a) adhoc=1; shift;;
+      -o|--output) out="$2"; shift 2;;
+      *) die "未知参数: $1";;
+    esac
+  done
+  [ -n "$in" ] || die "用法: ./ipa sign <输入.ipa|Xxx.app> --p12 cert.p12 --mobileprovision x.mobileprovision [-p 密码]"
+  [ -e "$in" ] || die "输入不存在: $in"
+  local ZS="${IPA_ZSIGN:-$TC/bin/zsign}"
+  [ -x "$ZS" ] || die "zsign 未安装，重跑 ./install.sh"
+
+  local args=()
+  if [ "$adhoc" = 1 ]; then
+    args+=("-a")
+  else
+    [ -n "$p12" ] || die "证书签名需要 --p12（Apple 开发者证书导出的 .p12，需带完整证书链）；只做伪签名请加 --adhoc"
+    [ -f "$p12" ] || die "找不到 p12: $p12"
+    if [ -n "$prov" ]; then
+      [ -f "$prov" ] || die "找不到描述文件: $prov"
+      args+=("-m" "$prov")
+    fi
+    args+=("-k" "$p12")
+    [ -n "$pass" ] && args+=("-p" "$pass")
+  fi
+  [ -n "$out" ] || out="${in%.*}-signed.ipa"
+  args+=("-o" "$out" "$in")
+
+  if [ "$adhoc" = 1 ]; then info "zsign ad-hoc 伪签名"; else info "zsign 证书签名"; fi
+  "$ZS" "${args[@]}" 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | tail -20
+  [ -f "$out" ] || die "签名失败，未产出 $out"
+  ok "输出: $out ($(du -h "$out" | cut -f1))"
+}
+
 case "${1:-}" in
   doctor) shift; cmd_doctor "$@";;
   install-sdk) shift; cmd_install_sdk "$@";;
   build) shift; cmd_build "$@";;
   pack) shift; cmd_pack "$@";;
+  sign) shift; cmd_sign "$@";;
   ""|-h|--help|help)
     sed -n '2,8p' "$0" | sed 's/^# /  /';;
-  *) die "未知命令: $1（可用: doctor / install-sdk / build / pack）";;
+  *) die "未知命令: $1（可用: doctor / install-sdk / build / pack / sign）";;
 esac
