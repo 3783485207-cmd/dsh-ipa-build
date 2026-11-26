@@ -3,3 +3,4 @@ dist/
 *.ipa
 *.o
 vendor/ldid-master/ldid
+.payload/
