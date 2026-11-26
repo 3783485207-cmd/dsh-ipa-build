@@ -120,10 +120,12 @@ def sig_state(base, _fat_endian=None):
         pos += size
     if sigoff is None or sigoff + 12 > len(data):
         return None
-    if rd(sigoff, 4, endian) != 0xfade0cc0:
+    # CodeSignature 的 SuperBlob 在文件里固定大端（FA DE 0C C0），
+    # 跟 slice 自己是小端还是大端无关，这里不能跟着 slice 走
+    if rd(sigoff, 4, 'be') != 0xfade0cc0:
         return None
-    count = rd(sigoff + 4, 4, endian)
-    types = [rd(sigoff + 8 + i * 8, 4, endian) for i in range(min(count, 20))]
+    count = rd(sigoff + 4, 4, 'be')
+    types = [rd(sigoff + 8 + i * 8, 4, 'be') for i in range(min(count, 20))]
     if 0x10000 in types:
         return 'cms'
     if 0 in types:

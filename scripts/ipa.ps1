@@ -97,13 +97,14 @@ function Get-SigState($fs, $base) {
     if ($sigoff -lt 0) { return '没签' }
     $sb = Read-At $fs $sigoff 12
     if ($sb -eq $null) { return '没签' }
-    if ((U32-At $sb 0 $be) -ne 4208856256) { return '没签' }
-    $cnt = U32-At $sb 4 $be
+    # SuperBlob 固定大端（FA DE 0C C0），不跟 slice 的字节序走
+    if ((U32-At $sb 0 $true) -ne 4208856256) { return '没签' }
+    $cnt = U32-At $sb 4 $true
     if ($cnt -gt 20) { $cnt = 20 }
     $idx = Read-At $fs ($sigoff + 8) ($cnt * 8)
     if ($idx -eq $null) { return '没签' }
     for ($i = 0; $i -lt $cnt; $i++) {
-        if ((U32-At $idx ($i * 8) $be) -eq 65536) { return '真证书签名（有 CMS）' }
+        if ((U32-At $idx ($i * 8) $true) -eq 65536) { return '真证书签名（有 CMS）' }
     }
     return 'ad-hoc 伪签名（只有 CodeDirectory）'
 }

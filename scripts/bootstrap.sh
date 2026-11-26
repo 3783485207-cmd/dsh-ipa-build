@@ -81,7 +81,7 @@ fi
 
 # ldid 是 ProcursusTeam/ldid v2.1.5-procursus8（commit 18255c5）的源码快照，
 # 想复现就 checkout 那个 commit；这里先校验快照没被改过
-LDID_CPP_SHA="%s"
+LDID_CPP_SHA="78a5f4d08f8affa6bbbf7b26947ba26023bca91347ee78c4f70d46cf7b67563d"
 
 if [ ! -x "$tc/bin/ldid" ]; then
   echo "编 ldid"
