@@ -10,7 +10,8 @@ vendor/ 下的第三方组件各自按自己的许可证分发，和上面的 MI
   你的分发行为若触发 AGPL 义务（例如对外提供修改后的 ldid 或其衍生作品），
   需自行履行 AGPL 的源码提供义务。
 - vendor/libplist-2.6.0.tar.bz2 —— libplist，LGPL-2.1（https://github.com/libimobiledevice/libplist）。ldid 编译时静态/动态链接它，动态链接时保留替换库的权利即可。
-- vendor/zsign/zsign.exe —— zsign（https://github.com/zhlynn/zsign），按其仓库许可证分发。
+- vendor/zsign/zsign.exe —— zsign v1.1.3 Windows 版，来自 https://github.com/zhlynn/zsign 。
+  该仓库声明的许可证是 GPL-3.0（见上游 LICENSE），二进制未做改动；分发前请按该仓库最新声明核对。
 - vendor/iPhoneOS16.5.sdk.tar.xz —— Apple 的 iPhoneOS SDK，版权归 Apple，仅随本插件用于本地交叉编译，不单独再分发 SDK。
 - iPhoneOS SDK 中的系统库头文件与 .tbd stub 版权归 Apple Inc.
 

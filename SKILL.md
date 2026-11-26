@@ -1,6 +1,6 @@
 ---
 name: dsh-ipa-build
-version: 1.3.1
+version: 1.3.2
 description: 把 iOS 程序做成 .ipa。源码能直接交叉编译成 arm64 包，现成的 .app 能打包，已有 ipa 能重签、改 bundle id 做多开，dylib 也跟着签。SDK、ldid、zsign 随插件带，环境由 AI 自己铺好，用户不用装东西。
 ---
 
@@ -72,7 +72,7 @@ scripts/ipa resign 旧包.ipa -o 新包.ipa --p12 dev.p12 --prov app.mobileprovi
 
 `pack`、`build` 同样认这三个参数。bundle id 必须和描述文件一致，否则签名失败。
 
-密码走命令行会进 shell 历史和进程列表，能让用户自己输入就别替他填。
+密码优先用 `IPA_CERT_PASSWORD` 环境变量，别写进命令行（会留在 shell 历史和进程列表里）。
 
 Windows 的 zsign 拿 p12 走完整签名链，签完查一次 OCSP，断网时会慢或报警告，不算失败。Linux / macOS 的证书签名也要 zsign，上游只发 Windows 版，得自己编一个放进 `~/.ipa-toolchain/bin/`。
 

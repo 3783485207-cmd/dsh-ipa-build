@@ -17,8 +17,110 @@ if (-not (Test-Path $zsign)) {
     if (Test-Path $vendored) { $zsign = $vendored }
 }
 if ($env:IPA_ZSIGN) { $zsign = $env:IPA_ZSIGN }
+# 工具链自己的环境变量文件，bootstrap 写在这里（不动用户持久 PATH）
+$envFile = Join-Path $tc 'env.ps1'
+if ((Test-Path $envFile) -and -not $env:IPA_NO_ENV) { . $envFile }
 
 function Die($m) { Write-Host $m; exit 1 }
+
+function Test-Bplist($path) {
+    if (-not (Test-Path $path)) { return $false }
+    $fs = [IO.File]::OpenRead($path)
+    try {
+        $b = New-Object byte[] 6
+        $fs.Read($b, 0, 6) | Out-Null
+        return ([Text.Encoding]::ASCII.GetString($b) -eq 'bplist')
+    } finally { $fs.Dispose() }
+}
+
+# 按偏移读一小段，不把整个可执行文件塞进内存
+function Read-At($fs, $off, $len) {
+    $b = New-Object byte[] $len
+    $fs.Position = $off
+    $n = $fs.Read($b, 0, $len)
+    if ($n -lt $len) { return $null }
+    return ,$b
+}
+
+function Cpu-Name($v) {
+    switch ($v) {
+        16777228 { 'arm64' }
+        16777223 { 'x86_64' }
+        12 { 'armv7' }
+        7 { 'i386' }
+        16777222 { 'arm64_32' }
+        default { '?' }
+    }
+}
+
+# 解析 LC_CODE_SIGNATURE 和签名 SuperBlob：有 CMS 才是真证书签名
+function Get-SigState($fs, $off) {
+    $h = Read-At $fs $off 32
+    if ($h -eq $null) { return '没签' }
+    $mg = [BitConverter]::ToUInt32($h, 0)
+    if ($mg -eq 4277009103) { $hsz = 32 } elseif ($mg -eq 4277009102) { $hsz = 28 } else { return '没签' }
+    $ncmds = [BitConverter]::ToUInt32($h, 16)
+    $sizeofcmds = [BitConverter]::ToUInt32($h, 20)
+    if ($ncmds -gt 4096 -or $sizeofcmds -gt 1048576) { return '没签' }
+    $cmds = Read-At $fs ($off + $hsz) $sizeofcmds
+    if ($cmds -eq $null) { return '没签' }
+    $sigoff = -1
+    $pos = 0
+    for ($i = 0; $i -lt $ncmds; $i++) {
+        if ($pos + 8 -gt $sizeofcmds) { break }
+        $cmd = [BitConverter]::ToUInt32($cmds, $pos)
+        $size = [BitConverter]::ToUInt32($cmds, $pos + 4)
+        if ($size -lt 8) { break }
+        if ($cmd -eq 29 -and $pos + 16 -le $sizeofcmds) { $sigoff = [BitConverter]::ToUInt32($cmds, $pos + 8) }
+        $pos += $size
+    }
+    if ($sigoff -lt 0) { return '没签' }
+    $sb = Read-At $fs $sigoff 12
+    if ($sb -eq $null -or [BitConverter]::ToUInt32($sb, 0) -ne 4208856256) { return '没签' }
+    $cnt = [BitConverter]::ToUInt32($sb, 4)
+    if ($cnt -gt 20) { $cnt = 20 }
+    $idx = Read-At $fs ($sigoff + 8) ($cnt * 8)
+    if ($idx -eq $null) { return '没签' }
+    for ($i = 0; $i -lt $cnt; $i++) {
+        if ([BitConverter]::ToUInt32($idx, $i * 8) -eq 0x10000) { return '真证书签名（有 CMS）' }
+    }
+    return 'ad-hoc 伪签名（只有 CodeDirectory）'
+}
+
+# fat binary 的 offset 4 是 nfat_arch，不是 cputype
+function Get-MachReport($path) {
+    $fs = $null
+    try { $fs = [IO.File]::OpenRead($path) } catch { return @('读不了', '读不了', 0) }
+    try {
+        $h = Read-At $fs 0 32
+        if ($h -eq $null) { return @('?', '读不了', (Get-Item $path).Length) }
+        $magic = [BitConverter]::ToUInt32($h, 0)
+        $archs = @()
+        $sig = '没签'
+        if ($magic -eq 4277009102 -or $magic -eq 4277009103) {
+            $archs += (Cpu-Name ([BitConverter]::ToUInt32($h, 4)))
+            $sig = Get-SigState $fs 0
+        } elseif ($magic -eq 3405691582 -or $magic -eq 3405691583) {
+            $nfat = [BitConverter]::ToUInt32($h, 4)
+            if ($nfat -gt 20) { $nfat = 0 }
+            $entSize = if ($magic -eq 3405691583) { 32 } else { 20 }
+            for ($i = 0; $i -lt $nfat; $i++) {
+                $e = Read-At $fs (8 + $i * $entSize) $entSize
+                if ($e -eq $null) { continue }
+                $archs += (Cpu-Name ([BitConverter]::ToUInt32($e, 0)))
+                $off = if ($entSize -eq 32) { [BitConverter]::ToUInt64($e, 8) } else { [BitConverter]::ToUInt32($e, 8) }
+                $st = Get-SigState $fs $off
+                if ($st -ne '没签') { $sig = $st }
+            }
+        } else {
+            $archs += '不是 Mach-O'
+        }
+        $archLabel = ($archs -join '+')
+        if ($archLabel -eq '') { $archLabel = '?' }
+        if ($archs.Count -gt 1) { $archLabel = "$archLabel（fat）" }
+        return @($archLabel, $sig, (Get-Item $path).Length)
+    } finally { if ($fs) { $fs.Dispose() } }
+}
 
 # $argv[1..0] 在 PowerShell 里会倒序取出 @($null, $argv[0])，后面 $null.StartsWith 直接崩
 function Rest($a) {
@@ -55,13 +157,21 @@ function Get-Value($pl, $key) {
 
 function Set-Value($pl, $key, $value) {
     if ($pl -eq $null) { return }
-    $nodes = $pl.plist.dict.ChildNodes
+    $dict = $pl.plist.dict
+    $nodes = $dict.ChildNodes
     for ($i = 0; $i -lt $nodes.Count - 1; $i++) {
         if ($nodes[$i].Name -eq 'key' -and $nodes[$i].InnerText -eq $key) {
             $v = $nodes[$i + 1]
-            if ($v.Name -eq 'string') { $v.InnerText = $value }
+            if ($v.Name -eq 'string') { $v.InnerText = $value; return }
         }
     }
+    # plist 里没有这个键就补上，不然 --name / --version 会静默不生效
+    $k = $pl.CreateElement('key')
+    $k.InnerText = $key
+    $v = $pl.CreateElement('string')
+    $v.InnerText = $value
+    $dict.AppendChild($k) | Out-Null
+    $dict.AppendChild($v) | Out-Null
 }
 
 function Get-Exe($app) {
@@ -77,8 +187,8 @@ function Get-Exe($app) {
         $b = New-Object byte[] 8
         $fs.Read($b, 0, 8) | Out-Null
         $fs.Close()
-        $m = [BitConverter]::ToUInt32($b, 0)
-        if ($m -eq 4277009103 -or $m -eq 4277009102 -or $m -eq 3199925962) { return $f.Name }
+        $m = [BitConverter]::ToUInt32($b, 0)  # 64/32 位 Mach-O、fat 的魔数：64/32 位 Mach-O 或 fat
+        if ($m -eq 4277009103 -or $m -eq 4277009102 -or $m -eq 3405691582 -or $m -eq 3405691583 -or $m -eq 3199925962) { return $f.Name }
     }
     return $null
 }
@@ -90,6 +200,13 @@ function Find-App($dir) {
 }
 
 function Zip-Dir($src, $out) {
+    # .NET 的 CreateFromDirectory 不认符号链接，会把链接展开成整份文件副本。
+    # .app 里带 framework 符号链接时包里会多出一堆重复文件，这里先说清楚
+    $links = Get-ChildItem $src -Recurse -Force -ErrorAction SilentlyContinue |
+             Where-Object { $_.Attributes -band [IO.FileAttributes]::ReparsePoint }
+    if ($links) {
+        Write-Host "包里有 $($links.Count) 个符号链接，Windows 打包会展开成副本（结构能用但体积偏大）。要严格保留链接请在 macOS 上用 scripts/ipa"
+    }
     $parent = Split-Path -Parent $out
     if ($parent -and -not (Test-Path $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
     if (Test-Path $out) { Remove-Item $out -Force }
@@ -99,7 +216,7 @@ function Zip-Dir($src, $out) {
 
 # 有 p12 就走真证书签名（zsign -k / -m / -p），没有就走 -a ad-hoc。
 # 真证书签名 zsign 会联网查 OCSP 吊销状态，离线时可能变慢或告警，这是它本来行为。
-function Sign-Ipa($in, $out, $p12, $prov, $pass) {
+function Sign-Ipa($in, $out, $p12, $prov, $pass, $ent) {
     if (-not (Test-Path $zsign)) { Die "没有 zsign.exe，先跑 scripts\bootstrap.ps1" }
     $parent = Split-Path -Parent $out
     if ($parent -and -not (Test-Path $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
@@ -111,6 +228,10 @@ function Sign-Ipa($in, $out, $p12, $prov, $pass) {
         if (-not (Test-Path $prov)) { Die "找不到描述文件: $prov" }
         $a = @('-k', (Resolve-Path $p12).Path, '-m', (Resolve-Path $prov).Path)
         if ($pass) { $a += @('-p', $pass) }
+        if ($ent) {
+            if (-not (Test-Path $ent)) { Die "找不到 entitlements 文件: $ent" }
+            $a += @('-e', (Resolve-Path $ent).Path)
+        }
         $a += @('-o', $out, $in)
     } else {
         if ($prov) { Write-Host "只有描述文件没有 p12，还是按伪签处理" }
@@ -119,6 +240,7 @@ function Sign-Ipa($in, $out, $p12, $prov, $pass) {
 
     # 直接用调用运算符传数组，PowerShell 会给带空格的参数自己加引号；
     # Start-Process 是把数组拼成一行再交给系统，密码里有空格就被拆成两个参数了
+    if ($pass) { Write-Host "提示：--password 会留在命令历史和进程列表里，建议改用环境变量 IPA_CERT_PASSWORD" }
     & $zsign @a
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path $out)) {
         if ($p12) { Die "zsign 签名失败，退出码 $LASTEXITCODE。常见原因是 p12 密码不对，或者 bundle id 跟描述文件对不上。" }
@@ -197,29 +319,32 @@ function Cmd-Info($path) {
         $app = $found.FullName
     }
     $pl = Read-Plist $app
+    $exe = Get-Exe $app
     Write-Host "位置     $path"
-    Write-Host "可执行   $(Get-Exe $app)"
+    Write-Host "可执行   $exe"
     Write-Host "标识符   $(Get-Value $pl 'CFBundleIdentifier')"
     Write-Host "版本     $(Get-Value $pl 'CFBundleShortVersionString') build $(Get-Value $pl 'CFBundleVersion')"
     Write-Host "最低系统 $(Get-Value $pl 'MinimumOSVersion')"
-    $exe = Get-Exe $app
+    $iplist = Join-Path $app 'Info.plist'
+    if ($pl -eq $null -and (Test-Bplist $iplist)) {
+        Write-Host "plist    是二进制格式（bplist），字段读不出来。要看字段先在 macOS 上 plutil -convert xml1 转成 XML"
+    }
     if ($exe -ne $null) {
         $bin = Join-Path $app $exe
-        $bytes = [IO.File]::ReadAllBytes($bin)
-        $cpu = [BitConverter]::ToInt32($bytes, 4)
-        $arch = '?'
-        if ($cpu -eq 16777228) { $arch = 'arm64' }
-        if ($cpu -eq 12) { $arch = 'armv7' }
-        if ($cpu -eq 16777223) { $arch = 'x86_64' }
-        Write-Host "架构     Mach-O $arch"
-        Write-Host ("大小     " + [math]::Round($bytes.Length / 1KB) + " KB")
-        $hasSig = $false
-        $text = [Text.Encoding]::ASCII.GetString($bytes)
-        if ($text.Contains('CodeDirectory')) { $hasSig = $true }
-        Write-Host ("签名     " + $(if ($hasSig) { '有 CodeDirectory' } else { '没签' }))
+        $rep = Get-MachReport $bin
+        Write-Host "架构     $($rep[0])"
+        Write-Host "签名     $($rep[1])"
+        Write-Host ("大小     " + [math]::Round($rep[2] / 1KB) + " KB")
     }
     if (Test-Path (Join-Path $app '_CodeSignature')) { Write-Host "签名目录 有 _CodeSignature" }
     if ($tmp -ne $null) { Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
+# 密码：命令行的照收，但没有就用环境变量，省得进 shell 历史
+function Get-Pass($opt) {
+    $p = Opt $opt @('--password', '--pass') $null
+    if (-not $p) { $p = $env:IPA_CERT_PASSWORD }
+    return $p
 }
 
 function Cmd-Pack($argv) {
@@ -273,7 +398,7 @@ function Cmd-Pack($argv) {
     $tmp = Join-Path ([IO.Path]::GetTempPath()) ('pack_' + [guid]::NewGuid().ToString('N') + '.ipa')
     Zip-Dir $work $tmp
     if (Test-Path $zsign) {
-        Sign-Ipa $tmp $out (Opt $opt @('--p12') $null) (Opt $opt @('--prov') $null) (Opt $opt @('--password', '--pass') $null)
+        Sign-Ipa $tmp $out (Opt $opt @('--p12') $null) (Opt $opt @('--prov') $null) (Get-Pass $opt) (Opt $opt @('--entitlements') $null)
     } else {
         Copy-Item $tmp $out -Force
         Write-Host "没有 zsign，包出来了但没签名"
@@ -317,9 +442,9 @@ function Cmd-Resign($argv) {
     $out = Opt $opt @('-o', '--out') $null
     if (-not $out) {
         $leaf = [IO.Path]::GetFileNameWithoutExtension((Split-Path -Leaf $src))
-        $out = Join-Path (Get-Location) "dist/${leaf}_signed.ipa"
+        $out = Join-Path (Get-Location) "dist/${leaf}_resigned.ipa"
     }
-    Sign-Ipa $in $out (Opt $opt @('--p12') $null) (Opt $opt @('--prov') $null) (Opt $opt @('--password', '--pass') $null)
+    Sign-Ipa $in $out (Opt $opt @('--p12') $null) (Opt $opt @('--prov') $null) (Get-Pass $opt) (Opt $opt @('--entitlements') $null)
     Write-Host "产物 $out"
 }
 
@@ -352,12 +477,17 @@ function Cmd-Build($argv) {
         $wsl = Get-Command wsl.exe -ErrorAction SilentlyContinue
         if ($wsl -ne $null) {
             Write-Host "本机没 clang，交给 WSL 编"
+            & wsl.exe bash -lc 'test -d "$HOME/.ipa-toolchain"'
+            if ($LASTEXITCODE -ne 0) {
+                Die "WSL 里还没铺过环境（那是 WSL 自己的 home，跟 Windows 这份不共用）。先在 WSL 里跑一次 bash scripts/bootstrap.sh，或者直接跑 scripts\bootstrap.ps1 把本机编译器装上。"
+            }
             $parts = @('bash', (Q (Join-Path $here 'ipa')), 'build', (Q (To-WslPath (Resolve-Path $src).Path)))
             # 路径参数一律换到 /mnt/...，不然产物落在 WSL 的 home 里，用户在 Windows 目录找不到
             $pathOpts = @('-o', '--out', '--icon', '--entitlements', '--p12', '--prov')
             $expectPath = $false
             foreach ($a in @(Rest $argv)) {
-                if ($expectPath -and -not $a.StartsWith('-')) {
+                $looksPath = (Test-Path $a) -or ($a -match '^[A-Za-z]:') -or ($a -match '[/\\]')
+                if (-not $a.StartsWith('-') -and ($expectPath -or $looksPath)) {
                     $full = $a
                     if (Test-Path $a) { $full = (Resolve-Path $a).Path }
                     elseif (-not [IO.Path]::IsPathRooted($a)) { $full = Join-Path (Get-Location) $a }
@@ -409,7 +539,7 @@ function Cmd-Build($argv) {
     $out = Opt $opt @('-o', '--out') $null
     if (-not $out) { $out = Join-Path (Get-Location) "dist/$name.ipa" }
     if (Test-Path $zsign) {
-        Sign-Ipa $pre $out (Opt $opt @('--p12') $null) (Opt $opt @('--prov') $null) (Opt $opt @('--password', '--pass') $null)
+        Sign-Ipa $pre $out (Opt $opt @('--p12') $null) (Opt $opt @('--prov') $null) (Get-Pass $opt) (Opt $opt @('--entitlements') $null)
     } else { Copy-Item $pre $out; Write-Host "没签名，只是打了个包" }
     Remove-Item $pre -Force -ErrorAction SilentlyContinue
     Write-Host "产物 $out"
@@ -428,9 +558,9 @@ if ($args.Count -eq 0) {
 
 switch ($args[0]) {
     'doctor' { Cmd-Doctor }
-    'info'   { Cmd-Info $args[1] }
-    'build'  { Cmd-Build @($args[1..($args.Count - 1)]) }
-    'pack'   { Cmd-Pack @($args[1..($args.Count - 1)]) }
-    'resign' { Cmd-Resign @($args[1..($args.Count - 1)]) }
+    'info'   { if ($args.Count -gt 1) { Cmd-Info $args[1] } else { Cmd-Info $null } }
+    'build'  { Cmd-Build @(Rest $args) }
+    'pack'   { Cmd-Pack @(Rest $args) }
+    'resign' { Cmd-Resign @(Rest $args) }
     default  { Write-Host "不认识的命令: $($args[0])"; exit 1 }
 }

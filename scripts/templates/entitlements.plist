@@ -2,8 +2,13 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-	<key>get-task-allow</key><true/>
+	<!-- 调试用，ad-hoc 签名时最常用；正式分发要删掉 -->
+	<key>get-task-allow</key>
+	<true/>
+	<!-- 下面两条是越狱环境的高权限私有 entitlement，默认不开。
+	     要调试系统级进程时才放开，放开前先想清楚包会被谁装：
 	<key>platform-application</key><true/>
 	<key>com.apple.private.security.no-container</key><true/>
+	-->
 </dict>
 </plist>

@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
 # ipa-build 入口。Linux / macOS 用这个，Windows 用同目录的 ipa.ps1。
-
 set -e
 
 here="$(cd "$(dirname "$0")" && pwd)"
@@ -11,6 +10,7 @@ ldid="${IPA_LDID:-$tc/bin/ldid}"
 
 die() { echo "$*" >&2; exit 1; }
 need_ldid() { [ -x "$ldid" ] || die "没找到 ldid，先跑 scripts/bootstrap.sh"; }
+need_py() { command -v python3 >/dev/null || die "缺 python3，改 plist 要用它（bootstrap 不装系统包，请自行 apt/dnf/pacman 装）"; }
 
 zsign_bin() {
   if [ -n "${IPA_ZSIGN:-}" ]; then echo "$IPA_ZSIGN"; return; fi
@@ -18,7 +18,17 @@ zsign_bin() {
   command -v zsign 2>/dev/null || true
 }
 
-# 有 p12 就走 zsign 真证书签名，没 p12 的地方还是走 ldid 伪签
+# 密码优先走环境变量，命令行参数只做兼容
+cert_pass() {
+  local cli="$1"
+  if [ -n "$cli" ]; then
+    echo "提示：--password 会进 shell 历史和进程列表，建议改用 IPA_CERT_PASSWORD" >&2
+    printf '%s' "$cli"; return
+  fi
+  printf '%s' "${IPA_CERT_PASSWORD:-}"
+}
+
+# 有 p12 就走 zsign 真签名，没 p12 的地方还是走 ldid 伪签
 sign_with_cert() {
   local in="$1" out="$2"
   local z; z="$(zsign_bin)"
@@ -33,19 +43,18 @@ sign_with_cert() {
 
 plist_get() {
   local dir="$1" key="$2"
-  python3 - "$dir/Info.plist" "$key" 2>/dev/null <<'PY' || true
+  python3 - "$dir/Info.plist" "$key" <<'PY' 2>/dev/null || true
 import plistlib, sys
 try:
     with open(sys.argv[1], 'rb') as f:
         d = plistlib.load(f)
-    v = d.get(sys.argv[2])
-    if v is not None:
-        print(v)
+    print(d.get(sys.argv[2], '') or '')
 except Exception:
     pass
 PY
 }
 
+# 只改/加字符串键；数字也按字符串写，CFBundleVersion 在规范里是字符串
 plist_set() {
   local dir="$1"; shift
   python3 - "$dir/Info.plist" "$@" <<'PY'
@@ -55,21 +64,86 @@ with open(path, 'rb') as f:
     d = plistlib.load(f)
 for p in pairs:
     k, _, v = p.partition('=')
-    if k == 'CFBundleVersion' and v.isdigit():
-        v = int(v)
     d[k] = v
 with open(path, 'wb') as f:
     plistlib.dump(d, f)
 PY
 }
 
-zip_payload() {
-  local out="$1" root="$2"
-  case "$out" in /*) ;; *) out="$PWD/$out";; esac
-  mkdir -p "$(dirname "$out")"
-  rm -f "$out"
-  ( cd "$root" && zip -qr "$out" Payload )
-  echo "$out" > "$root/.outpath"
+# 架构 + 签名状态，一次读完。不再用 file / 字符串搜索判断
+macho_report() {
+  python3 - "$1" <<'PY'
+import struct, sys
+
+CPU = {16777228: 'arm64', 16777223: 'x86_64', 12: 'armv7', 7: 'i386', 16777222: 'arm64_32'}
+
+path = sys.argv[1]
+try:
+    data = open(path, 'rb').read()
+except Exception as e:
+    print('读不了|%s' % e)
+    sys.exit()
+
+def u32(b, o):
+    return struct.unpack('<I', b[o:o + 4])[0]
+
+def sig_state(off):
+    magic = u32(data, off)
+    if magic == 0xfeedfacf:
+        hsz = 32
+    elif magic == 0xfeedface:
+        hsz = 28
+    else:
+        return None
+    ncmds = u32(data, off + 16)
+    sizeofcmds = u32(data, off + 20)
+    pos, end = off + hsz, off + hsz + sizeofcmds
+    sigoff = None
+    while pos + 8 <= end and pos + 8 <= len(data):
+        cmd, size = u32(data, pos), u32(data, pos + 4)
+        if size < 8:
+            break
+        if cmd == 0x1d and pos + 16 <= len(data):
+            sigoff = u32(data, pos + 8)
+        pos += size
+    if sigoff is None or sigoff + 12 > len(data):
+        return None
+    if u32(data, sigoff) != 0xfade0cc0:
+        return None
+    count = u32(data, sigoff + 4)
+    types = []
+    for i in range(min(count, 20)):
+        types.append(u32(data, sigoff + 8 + i * 8))
+    if 0x10000 in types:
+        return 'cms'
+    if 0 in types:
+        return 'adhoc'
+    return None
+
+magic = u32(data, 0)
+archs = []
+sig = None
+if magic in (0xfeedface, 0xfeedfacf):
+    archs = [CPU.get(u32(data, 4), '?')]
+    sig = sig_state(0)
+elif magic in (0xcafebabe, 0xcafebabf):
+    nfat = u32(data, 4)
+    if nfat <= 20:
+        for i in range(nfat):
+            e = 8 + i * (32 if magic == 0xcafebabf else 20)
+            if e + 8 > len(data):
+                break
+            archs.append(CPU.get(u32(data, e), '?'))
+            if sig is None:
+                off = struct.unpack('<Q' if magic == 0xcafebabf else '<I', data[e + 8:e + 16 if magic == 0xcafebabf else e + 12])[0]
+                if off < len(data):
+                    sig = sig_state(off)
+else:
+    archs = ['不是 Mach-O']
+
+label = {'cms': '真证书签名（有 CMS）', 'adhoc': 'ad-hoc 伪签名（只有 CodeDirectory）', None: '没签'}[sig]
+print('|'.join(['+'.join(archs) or '?', label]))
+PY
 }
 
 # Info.plist 里的 CFBundleExecutable 和实际文件名对不上时（手改过、重打包过），
@@ -78,27 +152,52 @@ find_exe() {
   local app="$1" e
   e="$(plist_get "$app" CFBundleExecutable)"
   if [ -n "$e" ] && [ -f "$app/$e" ]; then echo "$e"; return; fi
-  local f mag
-  for f in "$app"/*; do
-    [ -f "$f" ] || continue
-    mag="$(head -c 4 "$f" | od -An -tx1 | tr -d ' \n')"
-    case "$mag" in
-      cffaedfe|cefaedfe) basename "$f"; return;;
-    esac
-  done
-  echo ""
+  python3 - "$app" <<'PY' 2>/dev/null || true
+import os, struct, sys
+app = sys.argv[1]
+MAG = (0xfeedface, 0xfeedfacf, 0xcafebabe, 0xcafebabf)  # 32/64 位 Mach-O 和 fat
+for name in sorted(os.listdir(app)):
+    p = os.path.join(app, name)
+    if not os.path.isfile(p):
+        continue
+    try:
+        head = open(p, 'rb').read(4)
+        m = struct.unpack('<I', head)[0]
+        if m == 0xcafebabe and len(head) == 4:
+            # 0xcafebabe 也可能是 Java 类，看 nfat 是否像一个正常值
+            nfat = struct.unpack('<I', open(p, 'rb').read(8)[4:8])[0]
+            if nfat > 20:
+                continue
+    except Exception:
+        continue
+    if m in MAG:
+        print(name)
+        break
+PY
 }
 
 find_app() {
-  find "$1" -maxdepth 3 -name '*.app' -type d | head -1
+  find "$1" -maxdepth 3 -name '*.app' -type d 2>/dev/null | awk '{ print length($0), $0 }' | sort -n | head -1 | cut -d' ' -f2-
 }
 
 cmd_doctor() {
-  printf '%-9s %s\n' clang "$(command -v clang >/dev/null && clang --version | head -1 | sed 's/.*version //' || echo 缺)"
-  printf '%-9s %s\n' ld64.lld "$(command -v ld64.lld >/dev/null && echo ok || echo 缺)"
+  local v
+  v="$(command -v clang >/dev/null 2>&1 && clang --version 2>/dev/null | head -1 | sed 's/.*version //' || echo 缺)"
+  printf '%-9s %s\n' clang "$v"
+  printf '%-9s %s\n' ld64.lld "$(command -v ld64.lld >/dev/null 2>&1 && echo ok || echo 缺)"
   printf '%-9s %s\n' sdk "$([ -d "$sdk" ] && echo "$sdk" || echo 缺)"
   printf '%-9s %s\n' ldid "$([ -x "$ldid" ] && echo "$ldid" || echo 缺)"
+  printf '%-9s %s\n' python3 "$(command -v python3 >/dev/null 2>&1 && echo ok || echo 缺)"
+  printf '%-9s %s\n' zip "$(command -v zip >/dev/null 2>&1 && echo ok || echo 缺)"
+  printf '%-9s %s\n' unzip "$(command -v unzip >/dev/null 2>&1 && echo ok || echo 缺)"
   printf '%-9s %s\n' 系统 "$(uname -s)"
+  case "$(uname -s)" in
+    Linux)
+      if command -v apt-get >/dev/null 2>&1; then echo "包管理  apt（clang lld python3 zip unzip）"
+      elif command -v dnf >/dev/null 2>&1; then echo "包管理  dnf（clang lld python3 zip unzip）"
+      elif command -v pacman >/dev/null 2>&1; then echo "包管理  pacman（clang lld python zip unzip）"
+      else echo "包管理  认不出，bootstrap 只支持 apt/dnf/pacman"; fi;;
+  esac
 }
 
 cmd_info() {
@@ -112,19 +211,25 @@ cmd_info() {
   local exe; exe="$(find_exe "$t")"
   [ -n "$exe" ] || exe="$(basename "$t" .app)"
 
+  local bid ver build minos
+  bid="$(plist_get "$t" CFBundleIdentifier)"
+  ver="$(plist_get "$t" CFBundleShortVersionString)"
+  build="$(plist_get "$t" CFBundleVersion)"
+  minos="$(plist_get "$t" MinimumOSVersion)"
+
   echo "位置     $orig"
   echo "可执行   $exe"
-  echo "标识符   $(plist_get "$t" CFBundleIdentifier)"
-  echo "版本     $(plist_get "$t" CFBundleShortVersionString) build $(plist_get "$t" CFBundleVersion)"
-  echo "最低系统 $(plist_get "$t" MinimumOSVersion)"
+  echo "标识符   $bid"
+  echo "版本     $ver build $build"
+  echo "最低系统 $minos"
+  if [ -z "$bid$ver$minos" ]; then
+    echo "plist    读不出字段，多半是二进制格式（bplist）——Xcode 产出的包都是这种，换 pack 或 resign 处理前先 plutil -convert xml1"
+  fi
   if [ -f "$t/$exe" ]; then
-    echo "架构     $(file "$t/$exe" | sed 's/^[^:]*: //')"
+    local rep; rep="$(macho_report "$t/$exe")"
+    echo "架构     ${rep%%|*}"
+    echo "签名     ${rep#*|}"
     echo "大小     $(du -h "$t/$exe" | cut -f1)"
-    if "$ldid" -h "$t/$exe" 2>/dev/null | grep -q CodeDirectory; then
-      echo "签名     有 CodeDirectory，是伪签名"
-    else
-      echo "签名     没签"
-    fi
   fi
   [ -n "$tmp" ] && rm -rf "$tmp"
   true
@@ -139,7 +244,7 @@ cmd_build() {
   [ -d "$sdk" ] || die "没有 SDK，先跑 scripts/bootstrap.sh"
 
   local name="" bid="com.example.app" minios="14.0" ent="" icon="" out="" fw=()
-  local p12="" prov="" pwd_=""
+  local p12="" prov="" pwd_cli=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --name) name="$2"; shift 2;;
@@ -150,11 +255,12 @@ cmd_build() {
       --framework) fw+=(-framework "$2"); shift 2;;
       --p12) p12="$2"; shift 2;;
       --prov) prov="$2"; shift 2;;
-      --password|--pass) pwd_="$2"; shift 2;;
+      --password|--pass) pwd_cli="$2"; shift 2;;
       -o) out="$2"; shift 2;;
       *) die "不认识的参数: $1";;
     esac
   done
+  pwd_="$(cert_pass "$pwd_cli")"
   [ -n "$name" ] || name="$(basename "$src")"
   [ -n "$out" ] || out="$PWD/dist/$name.ipa"
 
@@ -162,11 +268,11 @@ cmd_build() {
   local app="$work/Payload/$name.app"
   rm -rf "$work"; mkdir -p "$app"
 
+  # 源码不限层级，跟 Windows 版保持一致
   local files=() f
-  while IFS= read -r f; do files+=("$f"); done < <(find "$src" -maxdepth 2 -type f \( -name '*.m' -o -name '*.mm' -o -name '*.c' -o -name '*.cpp' \))
+  while IFS= read -r f; do files+=("$f"); done < <(find "$src" -type f \( -name '*.m' -o -name '*.mm' -o -name '*.c' -o -name '*.cpp' \) ! -path '*/.build/*')
   [ ${#files[@]} -gt 0 ] || die "$src 里没有 .m/.mm/.c/.cpp"
 
-  # 碰了 UIKit 才链 UIKit，不然白拉一堆依赖
   if [ ${#fw[@]} -eq 0 ]; then
     if grep -rq "UIKit/" "$src" 2>/dev/null; then
       fw=(-framework UIKit -framework Foundation)
@@ -181,35 +287,43 @@ cmd_build() {
   done
 
   echo "编译 ${#files[@]} 个文件，arm64 ios$minios"
-  clang -target "arm64-apple-ios$minios" -isysroot "$sdk" \
-        -F "$sdk/System/Library/Frameworks" \
-        -fuse-ld=lld -O2 -fPIC "${arc[@]}" "${fw[@]}" \
-        -o "$app/$name" "${files[@]}"
+  clang -target "arm64-apple-ios$minios" -isysroot "$sdk" -F "$sdk/System/Library/Frameworks" -fuse-ld=lld -O2 -fPIC "${arc[@]}" "${fw[@]}" -o "$app/$name" "${files[@]}"
 
-  cp "$here/templates/Info.plist" "$app/Info.plist"
-  sed -i.bak "s|@NAME@|$name|g; s|@BUNDLEID@|$bid|g; s|@MINIOS@|$minios|g" "$app/Info.plist"
-  rm -f "$app/Info.plist.bak"
+  # 模板填充走 python，名字里带 & < | 也不会把 plist 弄坏
+  need_py
+  python3 - "$here/templates/Info.plist" "$app/Info.plist" "$name" "$bid" "$minios" <<'PY'
+import sys
+from xml.sax.saxutils import escape
+tpl, out, name, bid, minios = sys.argv[1:6]
+s = open(tpl, encoding='utf-8').read()
+for k, v in (('@NAME@', name), ('@BUNDLEID@', bid), ('@MINIOS@', minios)):
+    s = s.replace(k, escape(v))
+open(out, 'w', encoding='utf-8').write(s)
+PY
   [ -n "$icon" ] && [ -f "$icon" ] && cp "$icon" "$app/AppIcon60x60@2x.png"
-
   chmod +x "$app/$name"
+
   if [ -z "$p12" ]; then
     need_ldid
-    if [ -n "$ent" ] && [ -f "$ent" ]; then
-      "$ldid" -S"$ent" "$app/$name" || die "ldid 签名失败"
-    else
-      "$ldid" -S "$app/$name" || die "ldid 签名失败"
-    fi
+    if [ -n "$ent" ] && [ -f "$ent" ]; then "$ldid" -S"$ent" "$app/$name" || die "ldid 签名失败"
+    else "$ldid" -S "$app/$name" || die "ldid 签名失败"; fi
   fi
 
   local tmpipa="$out.tmp.ipa"
   zip_payload "$tmpipa" "$work"
-  if [ -n "$p12" ]; then
-    sign_with_cert "$tmpipa" "$out"
-    rm -f "$tmpipa"
-  else
-    mv -f "$tmpipa" "$out"
-  fi
+  if [ -n "$p12" ]; then sign_with_cert "$tmpipa" "$out"; rm -f "$tmpipa"
+  else mv -f "$tmpipa" "$out"; fi
+  rm -rf "$PWD/.build"
   echo "产物 $out"
+}
+
+zip_payload() {
+  local out="$1" root="$2"
+  case "$out" in /*) ;; *) out="$PWD/$out";; esac
+  mkdir -p "$(dirname "$out")"
+  rm -f "$out"
+  # -y 保留符号链接，别把 .framework 里的链接展开成重复文件
+  ( cd "$root" && zip -qry "$out" Payload )
 }
 
 cmd_pack() {
@@ -218,7 +332,7 @@ cmd_pack() {
   shift
   [ -e "$src" ] || die "没有这个路径: $src"
 
-  local out="" bid="" name="" version="" icon="" p12="" prov="" pwd_=""
+  local out="" bid="" name="" version="" icon="" p12="" prov="" pwd_cli=""
   while [ $# -gt 0 ]; do
     case "$1" in
       -o) out="$2"; shift 2;;
@@ -228,10 +342,11 @@ cmd_pack() {
       --icon) icon="$2"; shift 2;;
       --p12) p12="$2"; shift 2;;
       --prov) prov="$2"; shift 2;;
-      --password|--pass) pwd_="$2"; shift 2;;
+      --password|--pass) pwd_cli="$2"; shift 2;;
       *) die "不认识的参数: $1";;
     esac
   done
+  pwd_="$(cert_pass "$pwd_cli")"
 
   local work; work="$(mktemp -d)"; mkdir -p "$work/Payload"
   if [ -d "$src" ] && [ "$(basename "$src")" = "Payload" ]; then
@@ -241,13 +356,21 @@ cmd_pack() {
   fi
 
   local app; app="$(find "$work/Payload" -maxdepth 1 -name '*.app' -type d | head -1)"
-  [ -n "$app" ] || die "Payload 里没有 .app"
+  if [ -z "$app" ]; then
+    app="$(find "$work" -name '*.app' -type d | awk '{ print length($0), $0 }' | sort -n | head -1 | cut -d' ' -f2-)"
+    [ -n "$app" ] || die "这棵树里没找到 .app。可以直接把 .app 本身当参数传进来"
+    echo "给的目录里没有顶层 .app，改用找到的这个：$app"
+  fi
 
+  need_py
   local pairs=()
   [ -n "$bid" ] && pairs+=("CFBundleIdentifier=$bid")
   [ -n "$name" ] && pairs+=("CFBundleDisplayName=$name" "CFBundleExecutable=$name")
   [ -n "$version" ] && pairs+=("CFBundleShortVersionString=$version")
-  [ ${#pairs[@]} -gt 0 ] && plist_set "$app" "${pairs[@]}"
+  if [ ${#pairs[@]} -gt 0 ]; then
+    [ -f "$app/Info.plist" ] || die "$app 里没有 Info.plist"
+    plist_set "$app" "${pairs[@]}"
+  fi
   [ -n "$icon" ] && [ -f "$icon" ] && cp "$icon" "$app/AppIcon60x60@2x.png"
 
   local exe; exe="$(find_exe "$app")"
@@ -256,7 +379,7 @@ cmd_pack() {
     mv "$app/$exe" "$app/$name"
     exe="$name"
   fi
-  [ -z "$out" ] && out="$PWD/dist/$(basename "$app" .app).ipa"
+  [ -z "$out" ] && out="$PWD/dist/${name:-$(basename "$app" .app)}.ipa"
 
   if [ -z "$p12" ] && [ -f "$app/$exe" ] && [ -x "$ldid" ]; then
     rm -rf "$app/_CodeSignature"
@@ -265,14 +388,43 @@ cmd_pack() {
 
   local tmpipa="$out.tmp.ipa"
   zip_payload "$tmpipa" "$work"
-  if [ -n "$p12" ]; then
-    sign_with_cert "$tmpipa" "$out"
-    rm -f "$tmpipa"
-  else
-    mv -f "$tmpipa" "$out"
-  fi
+  if [ -n "$p12" ]; then sign_with_cert "$tmpipa" "$out"; rm -f "$tmpipa"
+  else mv -f "$tmpipa" "$out"; fi
   rm -rf "$work"
   echo "产物 $out"
+}
+
+# 内嵌的 framework / appex / dylib 都得签，只签主程序启动就崩
+sign_nested() {
+  local app="$1" ent="$2" d
+  if [ -d "$app/PlugIns" ]; then
+    while IFS= read -r x; do
+      local xe; xe="$(plist_get "$x" CFBundleExecutable)"
+      [ -n "$xe" ] || xe="$(basename "$x" .appex)"
+      if [ -n "$ent" ] && [ -f "$ent" ]; then "$ldid" -S"$ent" "$x/$xe" || die "签 $x 失败"
+      else "$ldid" -S "$x/$xe" || die "签 $x 失败"; fi
+      find "$x" -name '*.dylib' -type f | while read -r d; do "$ldid" -S "$d" || true; done
+    done < <(find "$app/PlugIns" -maxdepth 2 -name '*.appex' -type d 2>/dev/null)
+  fi
+  if [ -d "$app/Frameworks" ]; then
+    while IFS= read -r fwdir; do
+      local bin="$fwdir/$(basename "$fwdir" .framework)"
+      [ -f "$bin" ] && { "$ldid" -S "$bin" || die "签 $bin 失败"; }
+      find "$fwdir" -name '*.dylib' -type f | while read -r d; do "$ldid" -S "$d" || true; done
+    done < <(find "$app/Frameworks" -maxdepth 1 -name '*.framework' -type d 2>/dev/null)
+    find "$app/Frameworks" -maxdepth 1 -name '*.dylib' -type f | while read -r d; do "$ldid" -S "$d" || true; done
+  fi
+}
+
+# 换主 id 时扩展的 id 要跟着换，真签要求 appex id 以主 app id 开头
+retag_appex() {
+  local app="$1" bid="$2" x eid base
+  while IFS= read -r x; do
+    eid="$(plist_get "$x" CFBundleIdentifier)"
+    [ -n "$eid" ] || continue
+    base="${eid##*.}"
+    plist_set "$x" "CFBundleIdentifier=$bid.$base"
+  done < <(find "$app/PlugIns" -maxdepth 2 -name '*.appex' -type d 2>/dev/null)
 }
 
 cmd_resign() {
@@ -281,7 +433,7 @@ cmd_resign() {
   shift
   [ -e "$src" ] || die "没有这个路径: $src"
 
-  local out="" ent="" bid="" p12="" prov="" pwd_=""
+  local out="" ent="" bid="" p12="" prov="" pwd_cli=""
   while [ $# -gt 0 ]; do
     case "$1" in
       -o) out="$2"; shift 2;;
@@ -289,10 +441,11 @@ cmd_resign() {
       --bundle-id) bid="$2"; shift 2;;
       --p12) p12="$2"; shift 2;;
       --prov) prov="$2"; shift 2;;
-      --password|--pass) pwd_="$2"; shift 2;;
+      --password|--pass) pwd_cli="$2"; shift 2;;
       *) die "不认识的参数: $1";;
     esac
   done
+  pwd_="$(cert_pass "$pwd_cli")"
 
   local work; work="$(mktemp -d)"
   case "$src" in
@@ -304,31 +457,28 @@ cmd_resign() {
   local app; app="$(find "$work/Payload" -maxdepth 1 -name '*.app' -type d | head -1)"
   [ -n "$app" ] || die "包里没有 .app"
 
-  [ -n "$bid" ] && plist_set "$app" "CFBundleIdentifier=$bid"
+  if [ -n "$bid" ]; then
+    need_py
+    plist_set "$app" "CFBundleIdentifier=$bid"
+    retag_appex "$app" "$bid"
+  fi
   rm -rf "$app/_CodeSignature"
 
   local exe; exe="$(find_exe "$app")"
   [ -z "$exe" ] && die "这个 app 里没找到可执行文件"
   if [ -z "$p12" ]; then
     need_ldid
-    if [ -n "$ent" ] && [ -f "$ent" ]; then
-      "$ldid" -S"$ent" "$app/$exe"
-    else
-      "$ldid" -S "$app/$exe"
-    fi
-    # 包里带的 dylib 也得签，不然启动就崩
-    find "$app" -name '*.dylib' -type f 2>/dev/null | while read -r d; do "$ldid" -S "$d" 2>/dev/null || true; done
+    sign_nested "$app" "$ent"
+    if [ -n "$ent" ] && [ -f "$ent" ]; then "$ldid" -S"$ent" "$app/$exe" || die "ldid 签名失败"
+    else "$ldid" -S "$app/$exe" || die "ldid 签名失败"; fi
   fi
 
-  [ -z "$out" ] && out="${src%.*}_resigned.ipa"
+  local leaf; leaf="$(basename "$src")"; leaf="${leaf%.*}"
+  [ -z "$out" ] && out="$PWD/dist/${leaf}_resigned.ipa"
   local tmpipa="$out.tmp.ipa"
   zip_payload "$tmpipa" "$work"
-  if [ -n "$p12" ]; then
-    sign_with_cert "$tmpipa" "$out"
-    rm -f "$tmpipa"
-  else
-    mv -f "$tmpipa" "$out"
-  fi
+  if [ -n "$p12" ]; then sign_with_cert "$tmpipa" "$out"; rm -f "$tmpipa"
+  else mv -f "$tmpipa" "$out"; fi
   rm -rf "$work"
   echo "产物 $out"
 }
@@ -343,5 +493,5 @@ case "${1:-}" in
      echo "  info     看 ipa/app 的标识、版本、架构、签没签"
      echo "  build    .m/.c 编成 ipa，需要 clang 和 SDK"
      echo "  pack     .app 打成 ipa，可改标识/显示名/版本/图标"
-     echo "  resign   已有的 ipa 或 app 重做伪签名，可换标识";;
+     echo "  resign   已有的 ipa 或 app 重签，可换标识";;
 esac

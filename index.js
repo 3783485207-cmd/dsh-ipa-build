@@ -35,7 +35,7 @@ const provider = {
   },
 };
 
-const name = "skill-ipa-build";
+const name = "dsh-ipa-build";
 const inject = ["skills"];
 function apply(ctx) {
   ctx.skills.registerProvider(() => provider);

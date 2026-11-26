@@ -48,8 +48,10 @@ Windows 把 `scripts/ipa` 换成 `scripts\ipa.ps1`，子命令和参数一样。
 三个命令都认 `--p12 --prov --password`：
 
 ```bash
-scripts/ipa resign old.ipa -o new.ipa --p12 dev.p12 --prov app.mobileprovision --password 证书密码
+IPA_CERT_PASSWORD=证书密码 scripts/ipa resign old.ipa -o new.ipa --p12 dev.p12 --prov app.mobileprovision
 ```
+
+密码走 `IPA_CERT_PASSWORD` 环境变量，`--password` 只是兼容写法，会留在 shell 历史里。
 
 不给 p12 就是 ad-hoc 伪签：越狱机和 TrollStore 能装，普通设备装不上。Windows 上的 zsign 支持真签名；Linux/macOS 上要自己编一个 zsign 放进 `~/.ipa-toolchain/bin/`（上游只发 Windows 版）。
 
@@ -71,8 +73,8 @@ scripts/ipa info dist/HelloApp.ipa
 ## 包里的东西
 
 - `vendor/iPhoneOS16.5.sdk.tar.xz` — 16.5 的 iPhoneOS SDK，`.tbd` 已展开成真文件。sha256 `1d55ed9e66a37c0e6813c5be29df6f64f1ce448f58911a6cb87db07d5f6b8c58`
-- `vendor/zsign/zsign.exe` — 来自 https://github.com/zhlynn/zsign v1.1.3 的 Windows 版。MD5 `c42f137b76eb4cb2cad2b1a227a0f8f0`
-- `vendor/libplist-2.6.0.tar.bz2`、`vendor/ldid-master/` — Linux/macOS 编 ldid 用
+- `vendor/zsign/zsign.exe` — 来自 https://github.com/zhlynn/zsign v1.1.3 的 Windows 版。sha256 `abc1087da5a410c42fdbb8e90049802c2cc6c03fcd0ebb6d5c315b17f6d26a87`
+- `vendor/libplist-2.6.0.tar.bz2`、`vendor/ldid-master/` — Linux/macOS 编 ldid 用。ldid 是上游 master 的源码快照（没有 pin commit，所以不是一个可复现的构建，介意就自己换固定版本重编）
 
 第三方组件许可证各不相同，见 `NOTICE`：仓库自己的代码是 MIT，ldid 是 AGPL-3.0，libplist 是 LGPL-2.1，SDK 归 Apple，zsign 见上游仓库。
 

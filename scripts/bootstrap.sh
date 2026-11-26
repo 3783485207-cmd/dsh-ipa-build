@@ -17,11 +17,12 @@ if [ "$os" = "Darwin" ]; then
   if ! command -v clang >/dev/null 2>&1; then
     echo "缺 Xcode 命令行工具，开始装（系统会弹一个确认框，点一下就行）"
     xcode-select --install >/dev/null 2>&1 || true
-    for _ in 1 2 3 4 5 6 7 8; do
+    for i in 1 2 3 4 5 6 7 8; do
       command -v clang >/dev/null 2>&1 && break
+      echo "等 Xcode 命令行工具装完（$((i*15))s / 120s，网络慢就会超时）"
       sleep 15
     done
-    command -v clang >/dev/null 2>&1 || { echo "命令行工具还在装，装完再跑一次这个脚本"; exit 1; }
+    command -v clang >/dev/null 2>&1 || { echo "命令行工具还没装完（等了两分钟没等到）。等它装完再跑一次这个脚本就行"; exit 1; }
   fi
 
   # Apple 自带的 clang 不带 ld64.lld，得用 brew 的 llvm
@@ -38,16 +39,28 @@ if [ "$os" = "Darwin" ]; then
   fi
 else
   if ! command -v clang >/dev/null 2>&1; then
-    echo "缺 clang，从 apt 装"
-    # 不动 /etc/apt/sources.list：换源会影响这台机器上所有 apt 操作，
-    # 要换请自己换，或者 IPA_APT_MIRROR=tuna 让脚本换一次
-    if [ "${IPA_APT_MIRROR:-}" = "tuna" ] && [ -f /etc/apt/sources.list ] && ! grep -q tuna /etc/apt/sources.list; then
-      sudo sed -i 's|http://archive.ubuntu.com/ubuntu/|https://mirrors.tuna.tsinghua.edu.cn/ubuntu/|g' /etc/apt/sources.list
-      sudo sed -i 's|http://security.ubuntu.com/ubuntu/|https://mirrors.tuna.tsinghua.edu.cn/ubuntu/|g' /etc/apt/sources.list
+    echo "缺 clang，装一个"
+    if command -v apt-get >/dev/null 2>&1; then
+      # 不动系统软件源，换源影响这台机器上所有 apt 操作。
+      # 要换：IPA_APT_MIRROR=tuna bash scripts/bootstrap.sh，两种源格式都认
+      if [ "${IPA_APT_MIRROR:-}" = "tuna" ]; then
+        for f in /etc/apt/sources.list /etc/apt/sources.list.d/ubuntu.sources; do
+          [ -f "$f" ] || continue
+          sudo cp -n "$f" "$f.bak.ipa" 2>/dev/null || true
+          sudo sed -i 's|http://archive.ubuntu.com/ubuntu/|https://mirrors.tuna.tsinghua.edu.cn/ubuntu/|g; s|http://security.ubuntu.com/ubuntu/|https://mirrors.tuna.tsinghua.edu.cn/ubuntu/|g; s|http://deb.debian.org/debian/|https://mirrors.tuna.tsinghua.edu.cn/debian/|g; s|http://deb.debian.org/debian-security/|https://mirrors.tuna.tsinghua.edu.cn/debian-security/|g' "$f"
+        done
+      fi
+      sudo mkdir -p /var/lib/apt/lists/partial
+      sudo apt-get update -qq || true
+      sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq clang lld python3 zip unzip
+    elif command -v dnf >/dev/null 2>&1; then
+      sudo dnf install -y clang lld python3 zip unzip
+    elif command -v pacman >/dev/null 2>&1; then
+      sudo pacman -Sy --needed --noconfirm clang lld python zip unzip
+    else
+      echo "认不出包管理器（只有 apt / dnf / pacman 会装），请自己装 clang、lld、python3、zip、unzip" >&2
+      exit 1
     fi
-    sudo mkdir -p /var/lib/apt/lists/partial
-    sudo apt-get update -qq || true
-    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq clang lld
   fi
 
   # clang 调 ld64.lld 时按这个名字找，系统装的是带版本号的文件，做个软链接
@@ -74,8 +87,23 @@ if [ ! -x "$tc/bin/ldid" ]; then
     && cp ldid "$tc/bin/ldid" )
 fi
 
+SDK_SHA="1d55ed9e66a37c0e6813c5be29df6f64f1ce448f58911a6cb87db07d5f6b8c58"
+ZSIGN_SHA="abc1087da5a410c42fdbb8e90049802c2cc6c03fcd0ebb6d5c315b17f6d26a87"
+
+check_sha() {
+  local f="$1" want="$2"
+  [ -f "$f" ] || return 0
+  local got
+  if command -v sha256sum >/dev/null 2>&1; then got="$(sha256sum "$f" | cut -d' ' -f1)"
+  else got="$(shasum -a 256 "$f" | cut -d' ' -f1)"; fi
+  [ "$got" = "$want" ] || { echo "$f 的 sha256 对不上：$got（应为 $want），包被换过或者没下全，停下" >&2; exit 1; }
+}
+
+check_sha "$root/vendor/zsign/zsign.exe" "$ZSIGN_SHA"
+
 if [ ! -d "$tc/sdk/iPhoneOS16.5.sdk" ]; then
   echo "解包 SDK"
+  check_sha "$root/vendor/iPhoneOS16.5.sdk.tar.xz" "$SDK_SHA"
   tar -xJf "$root/vendor/iPhoneOS16.5.sdk.tar.xz" -C "$tc/sdk"
 fi
 

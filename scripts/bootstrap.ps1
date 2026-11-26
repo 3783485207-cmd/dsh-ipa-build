@@ -2,10 +2,10 @@
 # SDK 和 zsign 都在 vendor 里，直接从插件里拿；编译器没有的话脚本自己去搞。
 
 param(
+    # 只从 GitHub 官方 release 下。第三方加速代理能改文件内容，不在这里留位置；
+    # 慢就自己挂代理，别换源
     [string[]]$LlvmUrl = @(
-        'https://github.com/llvm/llvm-project/releases/download/llvmorg-18.1.8/clang+llvm-18.1.8-x86_64-pc-windows-msvc.tar.xz',
-        'https://ghfast.top/https://github.com/llvm/llvm-project/releases/download/llvmorg-18.1.8/clang+llvm-18.1.8-x86_64-pc-windows-msvc.tar.xz',
-        'https://gh-proxy.com/https://github.com/llvm/llvm-project/releases/download/llvmorg-18.1.8/clang+llvm-18.1.8-x86_64-pc-windows-msvc.tar.xz'
+        'https://github.com/llvm/llvm-project/releases/download/llvmorg-18.1.8/clang+llvm-18.1.8-x86_64-pc-windows-msvc.tar.xz'
     )
 )
 
@@ -38,30 +38,61 @@ function Find-Llvm {
     return $null
 }
 
+# 只改当前会话和工具链自己的 env.ps1，不动用户的持久 PATH：
+# 永久把某个 LLVM 前置到 PATH 会盖掉用户原来装的 clang，卸载插件也还原不回来
 function Use-Path($bin) {
     $env:PATH = "$bin;$env:PATH"
-    $old = [Environment]::GetEnvironmentVariable('Path', 'User')
-    if ($old -and -not $old.Contains($bin)) {
-        [Environment]::SetEnvironmentVariable('Path', "$bin;$old", 'User')
-    }
+    $envFile = Join-Path $tc 'env.ps1'
+    $line = '$env:PATH = "' + $bin + ';" + $env:PATH'
+    [IO.File]::WriteAllText($envFile, $line + [Environment]::NewLine)
+    Write-Host "要常驻的话自己加：$line"
+}
+
+function Get-FileSha256($path) { (Get-FileHash -Path $path -Algorithm SHA256).Hash.ToLower() }
+
+# 校验一个已有的归档：tar 能完整列出内容才算真的下全了。
+# 只看 "> 300MB" 会把半截文件也当成好的，续传拼错的文件更是过不了这一步
+function Test-Archive($path) {
+    if (-not (Test-Path $path)) { return $false }
+    & tar.exe -tJf $path *> $null
+    return ($LASTEXITCODE -eq 0)
 }
 
 function Get-LlvmArchive($dest) {
+    $hashFile = Join-Path $tc 'llvm.sha256'
+    $expect = if (Test-Path $hashFile) { (Get-Content $hashFile -Raw).Trim() } else { $null }
     foreach ($u in $LlvmUrl) {
         Write-Host "下载编译器：$u"
-        # --continue-at - 让断掉的下载接着走，重跑脚本不用从头再来
-        & curl.exe -L --retry 5 --retry-delay 5 --retry-all-errors --continue-at - --connect-timeout 15 -o $dest $u
-        if ($LASTEXITCODE -eq 0 -and (Test-Path $dest) -and ((Get-Item $dest).Length -gt 300MB)) { return $true }
-        Write-Host "这个源没成，换下一个"
+        # 不带 --continue-at：不支持 Range 的源会把文件拼坏，重下整份更稳
+        & curl.exe -L --retry 5 --retry-delay 5 --retry-all-errors --connect-timeout 15 -o ($dest + '.part') $u
+        if ($LASTEXITCODE -ne 0) { Write-Host "下载没成功，换下一个源"; continue }
+        Move-Item ($dest + '.part') $dest -Force
+        if (-not (Test-Archive $dest)) { Write-Host "下下来的包解不开，当没下成（多半是没下全或者被换过）"; Remove-Item $dest -Force; continue }
+        $sha = Get-FileSha256 $dest
+        Write-Host "sha256 $sha"
+        # 上游只发 GPG 签名，没有官方 sha256；所以第一次下完把哈希记下来，
+        # 以后每次下载都跟它比对，换文件立刻能发现
+        if ($expect -and $sha -ne $expect) { Write-Host "sha256 跟上次记的不一样（上次 $expect），这个文件不对，停下"; Remove-Item $dest -Force; continue }
+        if (-not $expect) { Set-Content -Path $hashFile -Value $sha -Encoding utf8 }
+        return $true
     }
     return $false
 }
 
 # SDK：vendor 里的包已经把 .tbd 软链展开成真文件了，Windows 解包不会再出空文件
 $sdkDir = Join-Path $tc 'sdk/iPhoneOS16.5.sdk'
+$SdkSha = '1d55ed9e66a37c0e6813c5be29df6f64f1ce448f58911a6cb87db07d5f6b8c58'
+$ZsignSha = 'abc1087da5a410c42fdbb8e90049802c2cc6c03fcd0ebb6d5c315b17f6d26a87'
+function Assert-Sha($path, $want, $what) {
+    if (-not (Test-Path $path)) { return }
+    $got = (Get-FileHash -Path $path -Algorithm SHA256).Hash.ToLower()
+    if ($got -ne $want) { Write-Host "$what 的 sha256 对不上（$got，应为 $want），文件被换过或没下全"; exit 1 }
+}
+
 if (-not (Test-Path $sdkDir)) {
     $archive = Join-Path $root 'vendor/iPhoneOS16.5.sdk.tar.xz'
     if (-not (Test-Path $archive)) { Write-Host "vendor 里没有 SDK 包，插件不完整"; exit 1 }
+    Assert-Sha $archive $SdkSha 'vendor/iPhoneOS16.5.sdk.tar.xz' 
     Write-Host "解包 SDK"
     & tar.exe -xJf $archive -C (Join-Path $tc 'sdk')
     if (-not (Test-Path $sdkDir)) { Write-Host "SDK 解包失败，看看 tar.exe 能不能用"; exit 1 }
@@ -89,7 +120,8 @@ if ($fixed -gt 0) { Write-Host "补了 $fixed 个没展开的 .tbd" }
 $zs = Join-Path $tc 'bin/zsign.exe'
 if (-not (Test-Path $zs)) {
     $srcZs = Join-Path $root 'vendor/zsign/zsign.exe'
-    if (Test-Path $srcZs) { Copy-Item $srcZs $zs -Force } else { Write-Host "vendor 里没有 zsign.exe，签不了名" }
+    if (Test-Path $srcZs) { Assert-Sha $srcZs $ZsignSha 'vendor/zsign/zsign.exe'; Copy-Item $srcZs $zs -Force }
+    else { Write-Host "vendor 里没有 zsign.exe，签不了名" }
 }
 
 # 编译器：找得到就用，找不到就装上
@@ -100,7 +132,7 @@ if ($bin) {
 } else {
     $dl = Join-Path $tc 'llvm.tar.xz'
     $ok = $false
-    if ((Test-Path $dl) -and ((Get-Item $dl).Length -gt 300MB)) { $ok = $true }
+    if (Test-Archive $dl) { $ok = $true }
     if (-not $ok) { $ok = Get-LlvmArchive $dl }
 
     if (-not $ok) {
@@ -110,6 +142,11 @@ if ($bin) {
             Write-Host "下载不通，用 winget 装"
             & winget install --id LLVM.LLVM -e --silent --accept-package-agreements --accept-source-agreements
             $bin = Find-Llvm
+            if ($bin -and (Test-Path (Join-Path $bin 'clang.exe'))) {
+                $ver = & (Join-Path $bin 'clang.exe') --version 2>$null | Select-Object -First 1
+                Write-Host "winget 装的编译器：$ver"
+                if ($ver -notmatch 'version 1[0-9]|version 2[0-9]') { Write-Host "版本跟预期差得远，编 iOS 可能出怪问题" }
+            }
         }
     } elseif ($ok) {
         Write-Host "解压编译器"
