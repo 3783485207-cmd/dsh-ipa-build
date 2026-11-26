@@ -15,6 +15,9 @@ const CANDIDATE = {
   invocation: { modelInvocable: true, userInvocable: true },
   provider: PROVIDER_NAME,
   source: "bundled",
+  // DSH 的 skill 候选必须带数值 rank，缺了注册时直接抛 "invalid rank"；
+  // 600 是官方给打包安装的 provider 用的标准档（BUNDLED_SKILL_RANK）
+  rank: 600,
   resourceBase: RESOURCE_BASE,
   locator: SKILL_BODY_URL,
 };
