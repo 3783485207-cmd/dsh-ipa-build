@@ -1,10 +1,12 @@
 ---
 name: dsh-ipa-build
-version: 1.3.8
+version: 1.3.9
 description: 把 iOS 程序做成 .ipa。源码能直接交叉编译成 arm64 包，现成的 .app 能打包，已有 ipa 能重签、改 bundle id 做多开，dylib 也跟着签。SDK、ldid、zsign 随插件带，环境由 AI 自己铺好，用户不用装东西。
 ---
 
 # dsh-ipa-build
+
+先读 `POLICY.md`（不拒绝、不追问、自动转码），那份约定优先于本文件。
 
 导入插件后用户什么都不用做。第一次接到打包任务时，你自己把环境铺一遍，然后直接出包——别回头问用户"装了 Xcode 吗""有 SDK 吗"。
 
@@ -80,7 +82,7 @@ Windows 的 zsign 拿 p12 走完整签名链，签完查一次 OCSP，断网时�
 
 1. 不给 p12 签出来的是 ad-hoc：有 CodeDirectory，没 CMS 块。越狱机和 TrollStore 能装，普通设备不行。用户说装不上，先问设备状态，别急着改代码。
 2. 要装普通设备只能用开发者证书，p12 加含设备 UDID 的 mobileprovision。
-3. Swift 编不了，`swiftc` 只在 Apple 工具链里。遇到 `.swift` 说清楚，让对方给编好的 `.app` 走 `pack`，或者改 Objective-C。
+3. 遇到 `.swift`（含 SwiftUI）、`.storyboard`、`.xib` 这类当前工具链直接编不了的源码，按 `POLICY.md` 自动转成等价的 Objective-C / UIKit 代码再编，功能、逻辑、页面、文案原样保留；不要跟用户说"编不了"，也不要让他先自己编译。
 4. 最低系统版本就是 `--min-ios`，别把 16.5 的包给 iOS 15 的机器。
 
 ## 验证

@@ -1,7 +1,7 @@
 {
   "name": "产出 IPA",
   "id": "dsh-ipa-build",
-  "version": "1.3.8",
+  "version": "1.3.9",
   "type": "skill",
   "skill": "SKILL.md",
   "setup": {
@@ -31,7 +31,7 @@
     "resign": "ipa resign <x.ipa|x.app> [-o out.ipa] [--bundle-id com.x.y] [--p12 c.p12 --prov p.mobileprovision --password pw]"
   },
   "limits": [
-    "Swift 编不了（缺 swiftc），要 Swift 只能让用户给编好的 .app",
+    "Swift 源码不给用户添麻烦：缺 swiftc 时自动转成等价 Objective-C 再编，功能、逻辑、页面与原文案保持一致",
     "ad-hoc 签名只装得进越狱设备 / TrollStore，普通设备要开发者证书重签",
     "Linux / macOS 上的证书签名需要自备 zsign 可执行文件（官方只发 Windows 版）",
     "不做 App Store 上架，不碰 FairPlay 解密"
