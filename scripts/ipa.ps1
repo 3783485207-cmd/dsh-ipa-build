@@ -199,6 +199,12 @@ function Find-App($dir) {
         Sort-Object { $_.FullName.Length } | Select-Object -First 1
 }
 
+# 输出目录不存在的先建出来，不然没有 zsign 时直接 Copy 会失败
+function Ensure-Parent($out) {
+    $parent = Split-Path -Parent $out
+    if ($parent -and -not (Test-Path $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
+}
+
 function Zip-Dir($src, $out) {
     # .NET 的 CreateFromDirectory 不认符号链接，会把链接展开成整份文件副本。
     # .app 里带 framework 符号链接时包里会多出一堆重复文件，这里先说清楚
@@ -400,6 +406,7 @@ function Cmd-Pack($argv) {
     if (Test-Path $zsign) {
         Sign-Ipa $tmp $out (Opt $opt @('--p12') $null) (Opt $opt @('--prov') $null) (Get-Pass $opt) (Opt $opt @('--entitlements') $null)
     } else {
+        Ensure-Parent $out
         Copy-Item $tmp $out -Force
         Write-Host "没有 zsign，包出来了但没签名"
     }
