@@ -20,12 +20,21 @@ if ($env:IPA_ZSIGN) { $zsign = $env:IPA_ZSIGN }
 
 function Die($m) { Write-Host $m; exit 1 }
 
-function Read-Plist($app) {
+# $argv[1..0] 在 PowerShell 里会倒序取出 @($null, $argv[0])，后面 $null.StartsWith 直接崩
+function Rest($a) {
+    if ($a.Count -gt 1) { return @($a[1..($a.Count - 1)]) }
+    return @()
+}
+
+function Read-Plist($app, [switch]$Strict) {
     $p = Join-Path $app 'Info.plist'
     if (-not (Test-Path $p)) { return $null }
     $b = [IO.File]::ReadAllBytes($p)
     if ($b.Length -gt 6 -and [Text.Encoding]::ASCII.GetString($b, 0, 6) -eq 'bplist') {
-        return $null   # 二进制 plist，这回不动它
+        # Xcode 产出的 Info.plist 基本都是 bplist，读不了就不能装作读到了：
+        # 改不动字段却照样改可执行文件名，包会起不来。宁可在这里停下。
+        if ($Strict) { Die "Info.plist 是二进制格式（bplist），这里改不了字段。先在 macOS 上 plutil -convert xml1 转成 XML，或者不带 --bundle-id/--name/--version 直接 pack。" }
+        return $null
     }
     try { return [xml](Get-Content $p -Raw -Encoding UTF8) } catch { return $null }
 }
@@ -217,7 +226,7 @@ function Cmd-Pack($argv) {
     if ($argv.Count -eq 0) { Die "用法: ipa.ps1 pack 某.app [-o 输出.ipa] [--bundle-id ...] [--p12 证书 --prov 描述文件 --password 密码]" }
     $src = $argv[0]
     if (-not (Test-Path $src)) { Die "没有这个路径: $src" }
-    $opt = Opts @($argv[1..($argv.Count - 1)])
+    $opt = Opts @(Rest $argv)
 
     $work = Join-Path ([IO.Path]::GetTempPath()) ('pack_' + [guid]::NewGuid().ToString('N'))
     $payload = Join-Path $work 'Payload'
@@ -232,7 +241,8 @@ function Cmd-Pack($argv) {
     $bid = Opt $opt @('--bundle-id') $null
     $name = Opt $opt @('--name') $null
     $ver = Opt $opt @('--version') $null
-    $pl = Read-Plist $app
+    $pl = $null
+    if ($bid -or $name -or $ver) { $pl = Read-Plist $app -Strict }
     if ($pl -ne $null) {
         if ($bid) { Set-Value $pl 'CFBundleIdentifier' $bid }
         if ($name) {
@@ -278,7 +288,7 @@ function Cmd-Resign($argv) {
     $src = $argv[0]
     if (-not (Test-Path $src)) { Die "没有这个路径: $src" }
     if (-not (Test-Path $zsign)) { Die "没有 zsign.exe，先跑 scripts\bootstrap.ps1" }
-    $opt = Opts @($argv[1..($argv.Count - 1)])
+    $opt = Opts @(Rest $argv)
 
     $in = $src
     if ($src -like '*.app') {
@@ -295,7 +305,7 @@ function Cmd-Resign($argv) {
         $tmp = Join-Path ([IO.Path]::GetTempPath()) ('bid_' + [guid]::NewGuid().ToString('N'))
         [IO.Compression.ZipFile]::ExtractToDirectory($in, $tmp)
         $a = Find-App (Join-Path $tmp 'Payload')
-        $pl = Read-Plist $a.FullName
+        $pl = Read-Plist $a.FullName -Strict
         if ($pl -ne $null) {
             Set-Value $pl 'CFBundleIdentifier' $bid
             $pl.Save((Join-Path $a.FullName 'Info.plist'))
@@ -314,7 +324,13 @@ function Cmd-Resign($argv) {
 }
 
 # WSL 里拼命令，每个参数单独用单引号包住，带空格的路径不会被拆开
-function Q($s) { "'" + ($s -replace "'", "'\\''") + "'" }
+function Q($s) {
+    # 单引号里的撇号要写成 '\'' 这一串（关引号、转义撇号、重开引号），
+    # 用 Replace 拼，别用 -replace 的替换串，那边反斜杠和引号会被吃掉
+    $bs = [char]92
+    $q  = [char]39
+    return $q + $s.Replace([string]$q, [string]$q + $bs + [string]$q + [string]$q) + $q
+}
 
 function To-WslPath($p) {
     $s = $p -replace '\\', '/'
@@ -326,7 +342,7 @@ function Cmd-Build($argv) {
     if ($argv.Count -eq 0) { Die "用法: ipa.ps1 build 源码目录 --name 名字 --bundle-id com.a.b [--p12 证书 --prov 描述文件 --password 密码]" }
     $src = $argv[0]
     if (-not (Test-Path $src)) { Die "没有这个目录: $src" }
-    $opt = Opts @($argv[1..($argv.Count - 1)])
+    $opt = Opts @(Rest $argv)
 
     $clang = Get-Command clang.exe -ErrorAction SilentlyContinue
     $lld = Get-Command ld64.lld.exe -ErrorAction SilentlyContinue
@@ -337,9 +353,20 @@ function Cmd-Build($argv) {
         if ($wsl -ne $null) {
             Write-Host "本机没 clang，交给 WSL 编"
             $parts = @('bash', (Q (Join-Path $here 'ipa')), 'build', (Q (To-WslPath (Resolve-Path $src).Path)))
-            foreach ($a in $argv[1..($argv.Count - 1)]) {
-                if ($a -match '^[A-Za-z]:\\' -or $a -match '^\.\w') { $parts += (Q (To-WslPath $a)) }
-                else { $parts += (Q $a) }
+            # 路径参数一律换到 /mnt/...，不然产物落在 WSL 的 home 里，用户在 Windows 目录找不到
+            $pathOpts = @('-o', '--out', '--icon', '--entitlements', '--p12', '--prov')
+            $expectPath = $false
+            foreach ($a in @(Rest $argv)) {
+                if ($expectPath -and -not $a.StartsWith('-')) {
+                    $full = $a
+                    if (Test-Path $a) { $full = (Resolve-Path $a).Path }
+                    elseif (-not [IO.Path]::IsPathRooted($a)) { $full = Join-Path (Get-Location) $a }
+                    $parts += (Q (To-WslPath $full))
+                    $expectPath = $false
+                    continue
+                }
+                $parts += (Q $a)
+                $expectPath = ($pathOpts -contains $a)
             }
             $cmd = $parts -join ' '
             & wsl.exe bash -lc $cmd

@@ -38,8 +38,10 @@ if [ "$os" = "Darwin" ]; then
   fi
 else
   if ! command -v clang >/dev/null 2>&1; then
-    echo "缺 clang，从 apt 装（源换清华镜像，国内快一点）"
-    if [ -f /etc/apt/sources.list ] && ! grep -q tuna /etc/apt/sources.list; then
+    echo "缺 clang，从 apt 装"
+    # 不动 /etc/apt/sources.list：换源会影响这台机器上所有 apt 操作，
+    # 要换请自己换，或者 IPA_APT_MIRROR=tuna 让脚本换一次
+    if [ "${IPA_APT_MIRROR:-}" = "tuna" ] && [ -f /etc/apt/sources.list ] && ! grep -q tuna /etc/apt/sources.list; then
       sudo sed -i 's|http://archive.ubuntu.com/ubuntu/|https://mirrors.tuna.tsinghua.edu.cn/ubuntu/|g' /etc/apt/sources.list
       sudo sed -i 's|http://security.ubuntu.com/ubuntu/|https://mirrors.tuna.tsinghua.edu.cn/ubuntu/|g' /etc/apt/sources.list
     fi
@@ -61,14 +63,14 @@ if [ ! -f "$tc/deps/lib/libplist-2.0.a" ]; then
   rm -rf "$tc/src/libplist-2.6.0"
   tar -xjf "$root/vendor/libplist-2.6.0.tar.bz2" -C "$tc/src"
   ( cd "$tc/src/libplist-2.6.0" && ./configure --prefix="$tc/deps" --disable-cython >/dev/null \
-    && make -j"$(nproc)" >/dev/null && make install >/dev/null )
+    && make -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu)" >/dev/null && make install >/dev/null )
 fi
 
 if [ ! -x "$tc/bin/ldid" ]; then
   echo "编 ldid"
   rm -rf "$tc/src/ldid-master"
   cp -r "$root/vendor/ldid-master" "$tc/src/"
-  ( cd "$tc/src/ldid-master" && PKG_CONFIG_PATH="$tc/deps/lib/pkgconfig" make -j"$(nproc)" >/dev/null \
+  ( cd "$tc/src/ldid-master" && PKG_CONFIG_PATH="$tc/deps/lib/pkgconfig" make -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu)" >/dev/null \
     && cp ldid "$tc/bin/ldid" )
 fi
 
