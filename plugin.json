@@ -1,7 +1,7 @@
 {
   "name": "产出 IPA",
   "id": "ipa-build",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "type": "skill",
   "skill": "SKILL.md",
   "setup": {
@@ -16,23 +16,24 @@
   },
   "home": "~/.ipa-toolchain",
   "capabilities": [
-    "arm64-apple-ios 交叉编译（clang + ld64.lld），Linux / macOS / 装有 LLVM 的 Windows",
-    "iPhoneOS16.5 SDK 框架链接，走 SDK 里的 .tbd stub",
+    "arm64-apple-ios 交叉编译（clang + ld64.lld），Linux / macOS / Windows 都能编，编译器由 bootstrap 自动装好",
+    "iPhoneOS16.5 SDK 框架链接，走 SDK 里的 .tbd stub（包内已展开，Windows 解包不会缺符号）",
     "伪签名：Linux/macOS 用 ldid，Windows 用 zsign",
+    "带证书签名：--p12 证书 --prov 描述文件 --password 密码，Windows 由 zsign 完成",
     "Payload/*.app -> .ipa 打包，可改 bundle id / 显示名 / 版本 / 图标",
     "已有 ipa 或 app 重签"
   ],
   "commands": {
     "doctor": "ipa doctor",
     "info": "ipa info <x.ipa|x.app>",
-    "build": "ipa build <源码目录> --name X --bundle-id com.x.y [--min-ios 14.0] [--framework UIKit] [--entitlements p.plist] [--icon i.png] [-o out.ipa]",
-    "pack": "ipa pack <Xxx.app> [-o out.ipa] [--bundle-id com.x.y] [--name 显示名] [--version 1.2] [--icon i.png]",
-    "resign": "ipa resign <x.ipa|x.app> [-o out.ipa] [--bundle-id com.x.y]"
+    "build": "ipa build <源码目录> --name X --bundle-id com.x.y [--min-ios 14.0] [--framework UIKit] [--entitlements p.plist] [--icon i.png] [--p12 c.p12 --prov p.mobileprovision --password pw] [-o out.ipa]",
+    "pack": "ipa pack <Xxx.app> [-o out.ipa] [--bundle-id com.x.y] [--name 显示名] [--version 1.2] [--icon i.png] [--p12 c.p12 --prov p.mobileprovision --password pw]",
+    "resign": "ipa resign <x.ipa|x.app> [-o out.ipa] [--bundle-id com.x.y] [--p12 c.p12 --prov p.mobileprovision --password pw]"
   },
   "limits": [
     "Swift 编不了（缺 swiftc），要 Swift 只能让用户给编好的 .app",
     "ad-hoc 签名只装得进越狱设备 / TrollStore，普通设备要开发者证书重签",
-    "Windows 上源码编译需要自备 LLVM（带 ld64.lld）或 WSL，脚本不代下 936MB",
+    "Linux / macOS 上的证书签名需要自备 zsign 可执行文件（官方只发 Windows 版）",
     "不做 App Store 上架，不碰 FairPlay 解密"
   ]
 }

@@ -12,6 +12,25 @@ ldid="${IPA_LDID:-$tc/bin/ldid}"
 die() { echo "$*" >&2; exit 1; }
 need_ldid() { [ -x "$ldid" ] || die "没找到 ldid，先跑 scripts/bootstrap.sh"; }
 
+zsign_bin() {
+  if [ -n "${IPA_ZSIGN:-}" ]; then echo "$IPA_ZSIGN"; return; fi
+  if [ -x "$tc/bin/zsign" ]; then echo "$tc/bin/zsign"; return; fi
+  command -v zsign 2>/dev/null || true
+}
+
+# 有 p12 就走 zsign 真证书签名，没 p12 的地方还是走 ldid 伪签
+sign_with_cert() {
+  local in="$1" out="$2"
+  local z; z="$(zsign_bin)"
+  [ -n "$z" ] || die "证书签名要用 zsign，这台机器上没找到。把 zsign 放到 $tc/bin/ 或 PATH 里再来"
+  [ -f "$p12" ] || die "找不到证书: $p12"
+  [ -n "$prov" ] || die "证书签名还得给描述文件: --prov xxx.mobileprovision"
+  [ -f "$prov" ] || die "找不到描述文件: $prov"
+  local a=(-k "$p12" -m "$prov")
+  [ -n "$pwd_" ] && a+=(-p "$pwd_")
+  "$z" "${a[@]}" -o "$out" "$in" || die "zsign 签名失败，多半是 p12 密码不对，或者 bundle id 跟描述文件对不上"
+}
+
 plist_get() {
   local dir="$1" key="$2"
   python3 - "$dir/Info.plist" "$key" 2>/dev/null <<'PY' || true
@@ -120,6 +139,7 @@ cmd_build() {
   [ -d "$sdk" ] || die "没有 SDK，先跑 scripts/bootstrap.sh"
 
   local name="" bid="com.example.app" minios="14.0" ent="" icon="" out="" fw=()
+  local p12="" prov="" pwd_=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --name) name="$2"; shift 2;;
@@ -128,6 +148,9 @@ cmd_build() {
       --entitlements) ent="$2"; shift 2;;
       --icon) icon="$2"; shift 2;;
       --framework) fw+=(-framework "$2"); shift 2;;
+      --p12) p12="$2"; shift 2;;
+      --prov) prov="$2"; shift 2;;
+      --password|--pass) pwd_="$2"; shift 2;;
       -o) out="$2"; shift 2;;
       *) die "不认识的参数: $1";;
     esac
@@ -135,7 +158,8 @@ cmd_build() {
   [ -n "$name" ] || name="$(basename "$src")"
   [ -n "$out" ] || out="$PWD/dist/$name.ipa"
 
-  local work="$PWD/.build/$name" app="$work/Payload/$name.app"
+  local work="$PWD/.build/$name"
+  local app="$work/Payload/$name.app"
   rm -rf "$work"; mkdir -p "$app"
 
   local files=() f
@@ -168,14 +192,23 @@ cmd_build() {
   [ -n "$icon" ] && [ -f "$icon" ] && cp "$icon" "$app/AppIcon60x60@2x.png"
 
   chmod +x "$app/$name"
-  need_ldid
-  if [ -n "$ent" ] && [ -f "$ent" ]; then
-    "$ldid" -S"$ent" "$app/$name" || die "ldid 签名失败"
-  else
-    "$ldid" -S "$app/$name" || die "ldid 签名失败"
+  if [ -z "$p12" ]; then
+    need_ldid
+    if [ -n "$ent" ] && [ -f "$ent" ]; then
+      "$ldid" -S"$ent" "$app/$name" || die "ldid 签名失败"
+    else
+      "$ldid" -S "$app/$name" || die "ldid 签名失败"
+    fi
   fi
 
-  zip_payload "$out" "$work"
+  local tmpipa="$out.tmp.ipa"
+  zip_payload "$tmpipa" "$work"
+  if [ -n "$p12" ]; then
+    sign_with_cert "$tmpipa" "$out"
+    rm -f "$tmpipa"
+  else
+    mv -f "$tmpipa" "$out"
+  fi
   echo "产物 $out"
 }
 
@@ -185,7 +218,7 @@ cmd_pack() {
   shift
   [ -e "$src" ] || die "没有这个路径: $src"
 
-  local out="" bid="" name="" version="" icon=""
+  local out="" bid="" name="" version="" icon="" p12="" prov="" pwd_=""
   while [ $# -gt 0 ]; do
     case "$1" in
       -o) out="$2"; shift 2;;
@@ -193,6 +226,9 @@ cmd_pack() {
       --name) name="$2"; shift 2;;
       --version) version="$2"; shift 2;;
       --icon) icon="$2"; shift 2;;
+      --p12) p12="$2"; shift 2;;
+      --prov) prov="$2"; shift 2;;
+      --password|--pass) pwd_="$2"; shift 2;;
       *) die "不认识的参数: $1";;
     esac
   done
@@ -222,12 +258,19 @@ cmd_pack() {
   fi
   [ -z "$out" ] && out="$PWD/dist/$(basename "$app" .app).ipa"
 
-  if [ -f "$app/$exe" ] && [ -x "$ldid" ]; then
+  if [ -z "$p12" ] && [ -f "$app/$exe" ] && [ -x "$ldid" ]; then
     rm -rf "$app/_CodeSignature"
     "$ldid" -S "$app/$exe" || echo "签名没成功，包还是打出来，装不装得上另说"
   fi
 
-  zip_payload "$out" "$work"
+  local tmpipa="$out.tmp.ipa"
+  zip_payload "$tmpipa" "$work"
+  if [ -n "$p12" ]; then
+    sign_with_cert "$tmpipa" "$out"
+    rm -f "$tmpipa"
+  else
+    mv -f "$tmpipa" "$out"
+  fi
   rm -rf "$work"
   echo "产物 $out"
 }
@@ -237,14 +280,16 @@ cmd_resign() {
   local src="${1:-}"; [ -n "$src" ] || die "用法: ipa resign 某.ipa 或 某.app [-o 输出.ipa]"
   shift
   [ -e "$src" ] || die "没有这个路径: $src"
-  need_ldid
 
-  local out="" ent="" bid=""
+  local out="" ent="" bid="" p12="" prov="" pwd_=""
   while [ $# -gt 0 ]; do
     case "$1" in
       -o) out="$2"; shift 2;;
       --entitlements) ent="$2"; shift 2;;
       --bundle-id) bid="$2"; shift 2;;
+      --p12) p12="$2"; shift 2;;
+      --prov) prov="$2"; shift 2;;
+      --password|--pass) pwd_="$2"; shift 2;;
       *) die "不认识的参数: $1";;
     esac
   done
@@ -264,16 +309,26 @@ cmd_resign() {
 
   local exe; exe="$(find_exe "$app")"
   [ -z "$exe" ] && die "这个 app 里没找到可执行文件"
-  if [ -n "$ent" ] && [ -f "$ent" ]; then
-    "$ldid" -S"$ent" "$app/$exe"
-  else
-    "$ldid" -S "$app/$exe"
+  if [ -z "$p12" ]; then
+    need_ldid
+    if [ -n "$ent" ] && [ -f "$ent" ]; then
+      "$ldid" -S"$ent" "$app/$exe"
+    else
+      "$ldid" -S "$app/$exe"
+    fi
+    # 包里带的 dylib 也得签，不然启动就崩
+    find "$app" -name '*.dylib' -type f 2>/dev/null | while read -r d; do "$ldid" -S "$d" 2>/dev/null || true; done
   fi
-  # 包里带的 dylib 也得签，不然启动就崩
-  find "$app" -name '*.dylib' -type f 2>/dev/null | while read -r d; do "$ldid" -S "$d" 2>/dev/null || true; done
 
   [ -z "$out" ] && out="${src%.*}_resigned.ipa"
-  zip_payload "$out" "$work"
+  local tmpipa="$out.tmp.ipa"
+  zip_payload "$tmpipa" "$work"
+  if [ -n "$p12" ]; then
+    sign_with_cert "$tmpipa" "$out"
+    rm -f "$tmpipa"
+  else
+    mv -f "$tmpipa" "$out"
+  fi
   rm -rf "$work"
   echo "产物 $out"
 }

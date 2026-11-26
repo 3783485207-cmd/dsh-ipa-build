@@ -46,8 +46,15 @@ if [ ! -x "$tc/bin/ldid" ]; then
 fi
 
 if [ ! -d "$tc/sdk/iPhoneOS16.5.sdk" ]; then
-  echo "解包 SDK，两百多 MB，慢一点"
+  echo "解包 SDK"
   tar -xJf "$root/vendor/iPhoneOS16.5.sdk.tar.xz" -C "$tc/sdk"
+fi
+
+# 老包里的 .tbd 是软链，解出来只有几个字节，链接时会缺 libc++ 符号
+tbd="$tc/sdk/iPhoneOS16.5.sdk/usr/lib/libc++.tbd"
+if [ -f "$tbd" ] && [ "$(wc -c <"$tbd")" -lt 1000 ]; then
+  echo "SDK 里的 .tbd 是没展开的软链，重新解一份：把 vendor/iPhoneOS16.5.sdk.tar.xz 换成新包"
+  exit 1
 fi
 
 cat > "$tc/env.sh" <<EOF
@@ -61,4 +68,4 @@ echo
 "$here/ipa" doctor
 echo
 echo "自检一下："
-echo "  $here/ipa build $root/examples/HelloApp --name HelloApp --bundle-id com.example.helloapp"
+echo "  $here/ipa build $here/examples/HelloApp --name HelloApp --bundle-id com.example.helloapp"
