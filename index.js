@@ -33,6 +33,8 @@ const provider = {
       provider: CANDIDATE.provider,
       source: CANDIDATE.source,
       resourceBase: RESOURCE_BASE,
+      // DSH 解析 skill 时对 list() 与 get() 的返回都做候选校验，两边都必须带数值 rank
+      rank: CANDIDATE.rank,
       content: await readFile(SKILL_BODY_URL, "utf8"),
     };
   },
