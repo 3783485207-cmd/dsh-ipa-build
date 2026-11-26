@@ -1,7 +1,7 @@
 {
   "name": "产出 IPA",
   "id": "dsh-ipa-build",
-  "version": "1.2.0",
+  "version": "1.2.4",
   "type": "skill",
   "skill": "SKILL.md",
   "setup": {

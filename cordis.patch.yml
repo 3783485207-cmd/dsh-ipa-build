@@ -1,0 +1,4 @@
+- insert:
+    - id: dsh-ipa-build
+      name: dsh-ipa-build
+      config: {}

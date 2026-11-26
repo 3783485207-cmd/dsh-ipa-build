@@ -1,6 +1,6 @@
 ---
 name: dsh-ipa-build
-version: 1.2.0
+version: 1.2.4
 description: 把 iOS 程序打包成 .ipa。机器上有编译器时可以直接把 Objective-C/C/C++ 源码编成 arm64 安装包；没有编译器时也能把现成的 .app 打成 ipa、给已有的 ipa 重做伪签名、改 bundle id 做多开。SDK、ldid、zsign 都在插件里，跑一次自带的 bootstrap 就把编译器也装好，用户不用手动装任何东西。不碰 Swift，也不做 App Store 上架。
 ---
 
