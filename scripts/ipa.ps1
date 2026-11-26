@@ -97,7 +97,7 @@ function Get-SigState($fs, $base) {
     if ($sigoff -lt 0) { return '没签' }
     $sb = Read-At $fs $sigoff 12
     if ($sb -eq $null) { return '没签' }
-    if (U32-At $sb 0 $be -ne 4208856256) { return '没签' }
+    if ((U32-At $sb 0 $be) -ne 4208856256) { return '没签' }
     $cnt = U32-At $sb 4 $be
     if ($cnt -gt 20) { $cnt = 20 }
     $idx = Read-At $fs ($sigoff + 8) ($cnt * 8)
