@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 编 iOS 可执行文件，签名，打包成 ipa。
+# ipa-build 入口。Linux / macOS 用这个，Windows 用同目录的 ipa.ps1。
 
 set -e
 
@@ -10,129 +10,283 @@ sdk="${IPA_SDK:-$tc/sdk/iPhoneOS16.5.sdk}"
 ldid="${IPA_LDID:-$tc/bin/ldid}"
 
 die() { echo "$*" >&2; exit 1; }
+need_ldid() { [ -x "$ldid" ] || die "没找到 ldid，先跑 scripts/bootstrap.sh"; }
 
-case "$1" in
+plist_get() {
+  local dir="$1" key="$2"
+  python3 - "$dir/Info.plist" "$key" 2>/dev/null <<'PY' || true
+import plistlib, sys
+try:
+    with open(sys.argv[1], 'rb') as f:
+        d = plistlib.load(f)
+    v = d.get(sys.argv[2])
+    if v is not None:
+        print(v)
+except Exception:
+    pass
+PY
+}
 
-doctor)
-  command -v clang    >/dev/null && echo "clang    $(clang --version|head -1|sed 's/.*version //')" || echo "clang    缺"
-  command -v ld64.lld >/dev/null && echo "ld64.lld ok" || echo "ld64.lld 缺"
-  [ -d "$sdk" ]  && echo "sdk      $sdk" || echo "sdk      缺"
-  [ -x "$ldid" ] && echo "ldid     $ldid" || echo "ldid     缺"
-  ;;
+plist_set() {
+  local dir="$1"; shift
+  python3 - "$dir/Info.plist" "$@" <<'PY'
+import plistlib, sys
+path, pairs = sys.argv[1], sys.argv[2:]
+with open(path, 'rb') as f:
+    d = plistlib.load(f)
+for p in pairs:
+    k, _, v = p.partition('=')
+    if k == 'CFBundleVersion' and v.isdigit():
+        v = int(v)
+    d[k] = v
+with open(path, 'wb') as f:
+    plistlib.dump(d, f)
+PY
+}
 
-build)
-  shift
-  src="$1"; shift || die "用法: ipa build 源码目录 --name App名 --bundle-id com.a.b"
-  [ -d "$src" ] || die "没有这个目录: $src"
+zip_payload() {
+  local out="$1" root="$2"
+  case "$out" in /*) ;; *) out="$PWD/$out";; esac
+  mkdir -p "$(dirname "$out")"
+  rm -f "$out"
+  ( cd "$root" && zip -qr "$out" Payload )
+  echo "$out" > "$root/.outpath"
+}
 
-  name=""
-  bid="com.example.app"
-  minios="14.0"
-  ent=""
-  icon=""
-  out=""
-  fw=()
-
-  while [ $# -gt 0 ]; do
-    case "$1" in
-      --name)        name="$2"; shift 2;;
-      --bundle-id)   bid="$2"; shift 2;;
-      --min-ios)     minios="$2"; shift 2;;
-      --entitlements) ent="$2"; shift 2;;
-      --icon)        icon="$2"; shift 2;;
-      --framework)   fw+=("-framework" "$2"); shift 2;;
-      -o)            out="$2"; shift 2;;
-      *)             die "不认识的参数: $1";;
+# Info.plist 里的 CFBundleExecutable 和实际文件名对不上时（手改过、重打包过），
+# 就按 Mach-O 魔数找一个真正的可执行文件
+find_exe() {
+  local app="$1" e
+  e="$(plist_get "$app" CFBundleExecutable)"
+  if [ -n "$e" ] && [ -f "$app/$e" ]; then echo "$e"; return; fi
+  local f mag
+  for f in "$app"/*; do
+    [ -f "$f" ] || continue
+    mag="$(head -c 4 "$f" | od -An -tx1 | tr -d ' \n')"
+    case "$mag" in
+      cffaedfe|cefaedfe) basename "$f"; return;;
     esac
   done
+  echo ""
+}
 
+find_app() {
+  find "$1" -maxdepth 3 -name '*.app' -type d | head -1
+}
+
+cmd_doctor() {
+  printf '%-9s %s\n' clang "$(command -v clang >/dev/null && clang --version | head -1 | sed 's/.*version //' || echo 缺)"
+  printf '%-9s %s\n' ld64.lld "$(command -v ld64.lld >/dev/null && echo ok || echo 缺)"
+  printf '%-9s %s\n' sdk "$([ -d "$sdk" ] && echo "$sdk" || echo 缺)"
+  printf '%-9s %s\n' ldid "$([ -x "$ldid" ] && echo "$ldid" || echo 缺)"
+  printf '%-9s %s\n' 系统 "$(uname -s)"
+}
+
+cmd_info() {
+  local t="$1" orig="$1" tmp=""
+  [ -e "$t" ] || die "没有这个路径: $t"
+  case "$t" in
+    *.ipa) tmp="$(mktemp -d)"; unzip -q "$t" -d "$tmp"; t="$(find_app "$tmp")";;
+  esac
+  [ -d "$t" ] || die "既不是 .app 也不是 .ipa"
+
+  local exe; exe="$(find_exe "$t")"
+  [ -n "$exe" ] || exe="$(basename "$t" .app)"
+
+  echo "位置     $orig"
+  echo "可执行   $exe"
+  echo "标识符   $(plist_get "$t" CFBundleIdentifier)"
+  echo "版本     $(plist_get "$t" CFBundleShortVersionString) build $(plist_get "$t" CFBundleVersion)"
+  echo "最低系统 $(plist_get "$t" MinimumOSVersion)"
+  if [ -f "$t/$exe" ]; then
+    echo "架构     $(file "$t/$exe" | sed 's/^[^:]*: //')"
+    echo "大小     $(du -h "$t/$exe" | cut -f1)"
+    if "$ldid" -h "$t/$exe" 2>/dev/null | grep -q CodeDirectory; then
+      echo "签名     有 CodeDirectory，是伪签名"
+    else
+      echo "签名     没签"
+    fi
+  fi
+  [ -n "$tmp" ] && rm -rf "$tmp"
+  true
+}
+
+cmd_build() {
+  shift
+  local src="${1:-}"; [ -n "$src" ] || die "用法: ipa build 源码目录 --name 名字 --bundle-id com.a.b"
+  shift
+  [ -d "$src" ] || die "没有这个目录: $src"
+  command -v clang >/dev/null || die "没有 clang，先跑 scripts/bootstrap.sh"
+  [ -d "$sdk" ] || die "没有 SDK，先跑 scripts/bootstrap.sh"
+
+  local name="" bid="com.example.app" minios="14.0" ent="" icon="" out="" fw=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --name) name="$2"; shift 2;;
+      --bundle-id) bid="$2"; shift 2;;
+      --min-ios) minios="$2"; shift 2;;
+      --entitlements) ent="$2"; shift 2;;
+      --icon) icon="$2"; shift 2;;
+      --framework) fw+=(-framework "$2"); shift 2;;
+      -o) out="$2"; shift 2;;
+      *) die "不认识的参数: $1";;
+    esac
+  done
   [ -n "$name" ] || name="$(basename "$src")"
   [ -n "$out" ] || out="$PWD/dist/$name.ipa"
 
-  work="$PWD/.ipa/$name"
-  rm -rf "$work"
-  app="$work/Payload/$name.app"
-  mkdir -p "$app"
+  local work="$PWD/.build/$name" app="$work/Payload/$name.app"
+  rm -rf "$work"; mkdir -p "$app"
 
-  files=()
+  local files=() f
   while IFS= read -r f; do files+=("$f"); done < <(find "$src" -maxdepth 2 -type f \( -name '*.m' -o -name '*.mm' -o -name '*.c' -o -name '*.cpp' \))
-  [ ${#files[@]} -gt 0 ] || die "目录里没有 .m/.mm/.c/.cpp"
+  [ ${#files[@]} -gt 0 ] || die "$src 里没有 .m/.mm/.c/.cpp"
 
+  # 碰了 UIKit 才链 UIKit，不然白拉一堆依赖
   if [ ${#fw[@]} -eq 0 ]; then
-    grep -rq "UIKit/" "$src" 2>/dev/null && fw=(-framework UIKit -framework Foundation) || fw=(-framework Foundation)
+    if grep -rq "UIKit/" "$src" 2>/dev/null; then
+      fw=(-framework UIKit -framework Foundation)
+    else
+      fw=(-framework Foundation)
+    fi
   fi
 
-  extra=()
+  local arc=()
   for f in "${files[@]}"; do
-    case "$f" in *.m|*.mm) extra=(-fobjc-arc); break;; esac
+    case "$f" in *.m|*.mm) arc=(-fobjc-arc); break;; esac
   done
 
-  echo "编 ${#files[@]} 个文件 -> arm64 ios$minios"
+  echo "编译 ${#files[@]} 个文件，arm64 ios$minios"
   clang -target "arm64-apple-ios$minios" -isysroot "$sdk" \
         -F "$sdk/System/Library/Frameworks" \
-        -fuse-ld=lld -O2 -fPIC "${extra[@]}" "${fw[@]}" \
+        -fuse-ld=lld -O2 -fPIC "${arc[@]}" "${fw[@]}" \
         -o "$app/$name" "${files[@]}"
 
-  # 顺手塞个 Info.plist 进去，不然装不上
-  cat > "$app/Info.plist" <<PLIST
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-	<key>CFBundleExecutable</key><string>$name</string>
-	<key>CFBundleIdentifier</key><string>$bid</string>
-	<key>CFBundleName</key><string>$name</string>
-	<key>CFBundlePackageType</key><string>APPL</string>
-	<key>CFBundleShortVersionString</key><string>1.0</string>
-	<key>CFBundleVersion</key><string>1</string>
-	<key>MinimumOSVersion</key><string>$minios</string>
-	<key>UIDeviceFamily</key><array><integer>1</integer><integer>2</integer></array>
-</dict></plist>
-PLIST
-
-  if [ -n "$icon" ] && [ -f "$icon" ]; then
-    cp "$icon" "$app/AppIcon60x60@2x.png"
-  fi
+  cp "$here/templates/Info.plist" "$app/Info.plist"
+  sed -i.bak "s|@NAME@|$name|g; s|@BUNDLEID@|$bid|g; s|@MINIOS@|$minios|g" "$app/Info.plist"
+  rm -f "$app/Info.plist.bak"
+  [ -n "$icon" ] && [ -f "$icon" ] && cp "$icon" "$app/AppIcon60x60@2x.png"
 
   chmod +x "$app/$name"
+  need_ldid
   if [ -n "$ent" ] && [ -f "$ent" ]; then
     "$ldid" -S"$ent" "$app/$name" || die "ldid 签名失败"
   else
     "$ldid" -S "$app/$name" || die "ldid 签名失败"
   fi
 
-  mkdir -p "$(dirname "$out")"
-  ( cd "$work" && zip -qr "$out" Payload )
-  echo "产物: $out"
-  unzip -l "$out" | sed -n '4,7p'
-  ;;
+  zip_payload "$out" "$work"
+  echo "产物 $out"
+}
 
-pack)
+cmd_pack() {
   shift
-  app="$1"; shift || die "用法: ipa pack 某.app [-o 输出.ipa]"
-  [ -d "$app" ] || die "没有这个目录: $app"
-  out=""
-  [ "${1:-}" = "-o" ] && out="$2"
-  nm="$(basename "$app" .app)"
-  [ -n "$out" ] || out="$PWD/dist/$nm.ipa"
+  local src="${1:-}"; [ -n "$src" ] || die "用法: ipa pack 某.app 或 含 Payload 的目录 [-o 输出.ipa]"
+  shift
+  [ -e "$src" ] || die "没有这个路径: $src"
 
-  exe="$app/$nm"
-  if [ ! -f "$exe" ]; then
-    exe="$(ls "$app" | head -1)"
+  local out="" bid="" name="" version="" icon=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -o) out="$2"; shift 2;;
+      --bundle-id) bid="$2"; shift 2;;
+      --name) name="$2"; shift 2;;
+      --version) version="$2"; shift 2;;
+      --icon) icon="$2"; shift 2;;
+      *) die "不认识的参数: $1";;
+    esac
+  done
+
+  local work; work="$(mktemp -d)"; mkdir -p "$work/Payload"
+  if [ -d "$src" ] && [ "$(basename "$src")" = "Payload" ]; then
+    cp -r "$src/." "$work/Payload/"
+  else
+    cp -r "$src" "$work/Payload/"
   fi
-  "$ldid" -S "$app/$(basename "$exe")" 2>/dev/null || true
 
-  tmp="$PWD/.ipa/pack"
-  rm -rf "$tmp"; mkdir -p "$tmp/Payload"
-  cp -r "$app" "$tmp/Payload/"
-  mkdir -p "$(dirname "$out")"
-  ( cd "$tmp" && zip -qr "$out" Payload )
-  echo "产物: $out"
-  ;;
+  local app; app="$(find "$work/Payload" -maxdepth 1 -name '*.app' -type d | head -1)"
+  [ -n "$app" ] || die "Payload 里没有 .app"
 
-*)
-  sed -n '2p' "$0"
-  echo "  ipa doctor   看环境齐不齐"
-  echo "  ipa build    编译源码出 ipa"
-  echo "  ipa pack     已有的 .app 打成 ipa"
-  ;;
+  local pairs=()
+  [ -n "$bid" ] && pairs+=("CFBundleIdentifier=$bid")
+  [ -n "$name" ] && pairs+=("CFBundleDisplayName=$name" "CFBundleExecutable=$name")
+  [ -n "$version" ] && pairs+=("CFBundleShortVersionString=$version")
+  [ ${#pairs[@]} -gt 0 ] && plist_set "$app" "${pairs[@]}"
+  [ -n "$icon" ] && [ -f "$icon" ] && cp "$icon" "$app/AppIcon60x60@2x.png"
+
+  local exe; exe="$(find_exe "$app")"
+  [ -n "$exe" ] || exe="$(basename "$app" .app)"
+  if [ -n "$name" ] && [ "$exe" != "$name" ] && [ -f "$app/$exe" ]; then
+    mv "$app/$exe" "$app/$name"
+    exe="$name"
+  fi
+  [ -z "$out" ] && out="$PWD/dist/$(basename "$app" .app).ipa"
+
+  if [ -f "$app/$exe" ] && [ -x "$ldid" ]; then
+    rm -rf "$app/_CodeSignature"
+    "$ldid" -S "$app/$exe" || echo "签名没成功，包还是打出来，装不装得上另说"
+  fi
+
+  zip_payload "$out" "$work"
+  rm -rf "$work"
+  echo "产物 $out"
+}
+
+cmd_resign() {
+  shift
+  local src="${1:-}"; [ -n "$src" ] || die "用法: ipa resign 某.ipa 或 某.app [-o 输出.ipa]"
+  shift
+  [ -e "$src" ] || die "没有这个路径: $src"
+  need_ldid
+
+  local out="" ent="" bid=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -o) out="$2"; shift 2;;
+      --entitlements) ent="$2"; shift 2;;
+      --bundle-id) bid="$2"; shift 2;;
+      *) die "不认识的参数: $1";;
+    esac
+  done
+
+  local work; work="$(mktemp -d)"
+  case "$src" in
+    *.ipa) unzip -q "$src" -d "$work";;
+    *.app) mkdir -p "$work/Payload"; cp -r "$src" "$work/Payload/";;
+    *) die "只认 .ipa 和 .app";;
+  esac
+
+  local app; app="$(find "$work/Payload" -maxdepth 1 -name '*.app' -type d | head -1)"
+  [ -n "$app" ] || die "包里没有 .app"
+
+  [ -n "$bid" ] && plist_set "$app" "CFBundleIdentifier=$bid"
+  rm -rf "$app/_CodeSignature"
+
+  local exe; exe="$(find_exe "$app")"
+  [ -z "$exe" ] && die "这个 app 里没找到可执行文件"
+  if [ -n "$ent" ] && [ -f "$ent" ]; then
+    "$ldid" -S"$ent" "$app/$exe"
+  else
+    "$ldid" -S "$app/$exe"
+  fi
+  # 包里带的 dylib 也得签，不然启动就崩
+  find "$app" -name '*.dylib' -type f 2>/dev/null | while read -r d; do "$ldid" -S "$d" 2>/dev/null || true; done
+
+  [ -z "$out" ] && out="${src%.*}_resigned.ipa"
+  zip_payload "$out" "$work"
+  rm -rf "$work"
+  echo "产物 $out"
+}
+
+case "${1:-}" in
+  doctor) cmd_doctor;;
+  info) shift; cmd_info "$@";;
+  build) cmd_build "$@";;
+  pack) cmd_pack "$@";;
+  resign) cmd_resign "$@";;
+  *) sed -n '2p' "$0"; echo; echo "  doctor   看环境齐不齐"
+     echo "  info     看 ipa/app 的标识、版本、架构、签没签"
+     echo "  build    .m/.c 编成 ipa，需要 clang 和 SDK"
+     echo "  pack     .app 打成 ipa，可改标识/显示名/版本/图标"
+     echo "  resign   已有的 ipa 或 app 重做伪签名，可换标识";;
 esac
