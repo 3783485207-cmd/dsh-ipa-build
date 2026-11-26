@@ -1,5 +1,7 @@
 # 产出 IPA
 
+插件包名 `dsh-ipa-build`。装的时候 `dsh plugin add dsh-ipa-build`，或者直接把目录拷进 DSH 的插件目录。
+
 装好这套东西，本机就能把 Objective-C 源码编成 `.ipa`，也能把现成的 `.app` 打包、改标识、重新签名。Windows 一样能用，不用装 WSL，也不用自己去找 SDK。
 
 ## 装
