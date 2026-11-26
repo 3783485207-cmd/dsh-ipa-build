@@ -79,14 +79,23 @@ CPU = {16777228: 'arm64', 16777223: 'x86_64', 12: 'armv7', 7: 'i386', 16777222: 
 
 path = sys.argv[1]
 try:
-    data = open(path, 'rb').read()
+    fh = open(path, 'rb')
 except Exception as e:
     print('读不了|%s' % e)
     sys.exit()
+# 几百 MB 的二进制整读会把内存翻倍，这里只按偏移 seek 读
+fh.seek(0, 2)
+size = fh.tell()
 
 def rd(off, n, endian):
+    if off is None or off < 0 or off + n > size:
+        return None
+    fh.seek(off)
+    raw = fh.read(n)
+    if len(raw) != n:
+        return None
     fmt = ('>' if endian == 'be' else '<') + ('I' if n == 4 else 'Q')
-    return struct.unpack(fmt, data[off:off + n])[0]
+    return struct.unpack(fmt, raw)[0]
 
 def sig_state(base, _fat_endian=None):
     # slice 自己的字节序看它自己的 magic，不能沿用 fat 头的字节序
@@ -110,15 +119,15 @@ def sig_state(base, _fat_endian=None):
         return None
     pos, end = base + hsz, base + hsz + sizeofcmds
     sigoff = None
-    while pos + 8 <= end and pos + 8 <= len(data):
-        cmd, size = rd(pos, 4, endian), rd(pos + 4, 4, endian)
-        if size < 8:
+    while pos + 8 <= end and pos + 8 <= size:
+        cmd, cmdsz = rd(pos, 4, endian), rd(pos + 4, 4, endian)
+        if cmdsz is None or cmdsz < 8:
             break
-        if cmd == 0x1d and pos + 16 <= len(data):
+        if cmd == 0x1d and pos + 16 <= size:
             # dataoff 相对 slice 起点，fat 里要加上 base
             sigoff = base + rd(pos + 8, 4, endian)
-        pos += size
-    if sigoff is None or sigoff + 12 > len(data):
+        pos += cmdsz
+    if sigoff is None or sigoff + 12 > size:
         return None
     # CodeSignature 的 SuperBlob 在文件里固定大端（FA DE 0C C0），
     # 跟 slice 自己是小端还是大端无关，这里不能跟着 slice 走
@@ -152,15 +161,15 @@ elif magic in (0xcefaedfe, 0xcffaedfe):
     sig = sig_state(0, 'be')
 elif magic in FAT:
     endian, entSize = FAT[magic]
-    nfat = rd(4, 4, endian)
+    nfat = rd(4, 4, endian) or 0
     if nfat <= 20:
         for i in range(nfat):
             e = 8 + i * entSize
-            if e + entSize > len(data):
+            if e + entSize > size:
                 break
             archs.append(CPU.get(rd(e, 4, endian), '?'))
             off = rd(e + 8, 8 if entSize == 32 else 4, endian)
-            if off < len(data):
+            if off is not None and off < size:
                 st = sig_state(off)
                 # 多个切片取最强的那个：任一有 CMS 就是真证书签名
                 if st == 'cms' or (st and sig is None):
@@ -172,6 +181,7 @@ else:
 
 label = {'cms': '真证书签名（有 CMS）', 'adhoc': 'ad-hoc 伪签名（只有 CodeDirectory）', None: '没签'}[sig]
 print('|'.join(['+'.join(archs) or '?', label]))
+fh.close()
 PY
 }
 
@@ -186,7 +196,12 @@ import os, struct, sys
 app = sys.argv[1]
 # 32/64 位 Mach-O、标准 fat（小端读出 0xBEBAFECA）和字节交换变体
 MAG = (0xfeedface, 0xfeedfacf, 0xcefaedfe, 0xcffaedfe, 0xbebafeca, 0xbfbafeca, 0xcafebabe, 0xcafebabf)
-for name in sorted(os.listdir(app)):
+base = os.path.basename(app.rstrip('/'))
+prefer = [base[:-4]] if base.endswith('.app') else []
+names = sorted(os.listdir(app))
+# 顶层常有 helper 之类的其他 Mach-O，app 同名的那份才是主程序，先试它
+cand = [n for n in prefer if n in names] + [n for n in names if n not in prefer]
+for name in cand:
     p = os.path.join(app, name)
     if not os.path.isfile(p):
         continue
@@ -347,7 +362,8 @@ PY
   zip_payload "$tmpipa" "$work"
   if [ -n "$p12" ]; then sign_with_cert "$tmpipa" "$out"; rm -f "$tmpipa"
   else mv -f "$tmpipa" "$out"; fi
-  rm -rf "$PWD/.build"
+  # 只删这次构建的目录，同 cwd 下别的 app 的中间产物不能连坐
+  rm -rf "$work"; rmdir "$PWD/.build" 2>/dev/null || true
   echo "产物 $out"
 }
 
@@ -435,10 +451,16 @@ sign_nested() {
     while IFS= read -r x; do
       local xe; xe="$(plist_get "$x" CFBundleExecutable)"
       [ -n "$xe" ] || xe="$(basename "$x" .appex)"
-      if [ -n "$ent" ] && [ -f "$ent" ]; then "$ldid" -S"$ent" "$x/$xe" || die "签 $x 失败"
+      # 扩展用自己的 entitlements（app groups 之类跟主 app 不一样），
+      # 没有就裸签，别把主 app 的高权限项摊到扩展上
+      local xent=""
+      for cand in "$x/Entitlements.plist" "$(dirname "$x")/$(basename "$x" .appex).entitlements"; do
+        [ -f "$cand" ] && { xent="$cand"; break; }
+      done
+      if [ -n "$xent" ]; then "$ldid" -S"$xent" "$x/$xe" || die "签 $x 失败"
       else "$ldid" -S "$x/$xe" || die "签 $x 失败"; fi
       find "$x" -name '*.dylib' -type f | while read -r d; do "$ldid" -S "$d" || true; done
-    done < <(find "$app/PlugIns" -maxdepth 2 -name '*.appex' -type d 2>/dev/null)
+    done < <(find "$app" -name '*.appex' -type d -not -path '*/Frameworks/*' 2>/dev/null)
   fi
   if [ -d "$app/Frameworks" ]; then
     while IFS= read -r fwdir; do
@@ -452,13 +474,24 @@ sign_nested() {
 
 # 换主 id 时扩展的 id 要跟着换，真签要求 appex id 以主 app id 开头
 retag_appex() {
-  local app="$1" bid="$2" x eid base
+  local app="$1" bid="$2" x eid pre
+  # 用扩展自己的 bundle 名，不取旧 id 的最后一段：两个扩展末段同名会撞 id。
+  # Watch 里的扩展要挂在 watchkitapp 下面。
   while IFS= read -r x; do
     eid="$(plist_get "$x" CFBundleIdentifier)"
     [ -n "$eid" ] || continue
-    base="${eid##*.}"
-    plist_set "$x" "CFBundleIdentifier=$bid.$base"
-  done < <(find "$app/PlugIns" -maxdepth 2 -name '*.appex' -type d 2>/dev/null)
+    case "$x" in
+      */Watch/*) pre="$bid.watchkitapp" ;;
+      *) pre="$bid" ;;
+    esac
+    plist_set "$x" "CFBundleIdentifier=$pre.$(basename "$x" .appex)"
+  done < <(find "$app" -name '*.appex' -type d 2>/dev/null)
+  # Watch/<x>.app 自己也是一个要真签的包，id 得跟着主 app 走
+  while IFS= read -r x; do
+    eid="$(plist_get "$x" CFBundleIdentifier)"
+    [ -n "$eid" ] || continue
+    plist_set "$x" "CFBundleIdentifier=$bid.watchkitapp"
+  done < <(find "$app" -path '*/Watch/*.app' -type d 2>/dev/null)
 }
 
 cmd_resign() {

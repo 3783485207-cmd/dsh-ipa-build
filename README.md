@@ -59,7 +59,9 @@ IPA_CERT_PASSWORD=证书密码 scripts/ipa resign old.ipa -o new.ipa --p12 dev.p
 
 ## 平台差异
 
-`pack` / `resign` / `info` 不依赖编译器，三平台行为一样。`build` 要 clang + ld64.lld：Linux/macOS 跑完 bootstrap 就有；Windows 上 bootstrap 会装 LLVM，实在装不上而机器里有 WSL 时，`build` 会把活转给 WSL 里的 bash 版本，命令不用改。
+`pack` / `resign` / `info` 不依赖编译器，三平台行为一样。`build` 要 clang + ld64.lld：Linux/macOS 跑完 bootstrap 就有；Windows 上 bootstrap 会装 LLVM，实在装不上而机器里有 WSL 时，`build` 会把活转给 WSL 里的 bash 版本，命令不用改；密码按推荐方式放在 `IPA_CERT_PASSWORD` 里也会显式带进 WSL（wsl.exe 本身不传 Windows 环境变量）。
+
+已知差异：打 `.app` 成 `.ipa` 时，Linux/macOS 用 `zip -y` 保留符号链接，Windows 用 .NET 的 zip 实现会把 `.framework` 里的链接展开成文件副本（打包时会给出提示）。两种包都能装，但同一个 `.app` 两端打出来的体积和文件列表不一样；要完全一致就在 WSL 里跑 `pack`。
 
 ## 自检
 
@@ -68,7 +70,7 @@ scripts/ipa build scripts/examples/HelloApp --name HelloApp --bundle-id com.exam
 scripts/ipa info dist/HelloApp.ipa
 ```
 
-`info` 的签名行有内容就说明编译、打包、签名这条链路通了。没有编译器的机器用 `pack` 打这个例子也能验证打包和签名。
+`info` 的签名行有内容就说明编译、打包、签名这条链路通了。签名判定按真实布局读：Mach-O 头和 load command 跟 slice 字节序走，签名 SuperBlob 固定大端。没有编译器的机器用 `pack` 打这个例子也能验证打包和签名。
 
 ## 包里的东西
 

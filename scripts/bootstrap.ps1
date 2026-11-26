@@ -8,6 +8,9 @@ param(
         'https://github.com/llvm/llvm-project/releases/download/llvmorg-18.1.8/clang+llvm-18.1.8-x86_64-pc-windows-msvc.tar.xz'
     ),
     # 上面那份 18.1.8 的 sha256，实测校验过（936MB，下完 tar -tJf 能完整列出）
+    # 注意：这个值写死就等于“只认这一个包”，如果上游换了 18.1.8 的构建产物，安装会被一直拒绝。
+    # 换机或换网络重下时若报对不上，先核对 size 981666720 与 tar 列表，再确认是不是上游换了包，别直接改这个数。
+    # 待办：在一台干净 Windows 机上完整跑一次 bootstrap.ps1 复核这个锚点。
     # 换 URL 的话这个哈希也要跟着换，不然会被判成"文件不对"
     [string]$LlvmSha = '22c5907db053026cc2a8ff96d21c0f642a90d24d66c23c6d28ee7b1d572b82e8'
 )

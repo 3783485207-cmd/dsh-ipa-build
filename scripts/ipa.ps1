@@ -60,8 +60,14 @@ function U32-At($b, $o, $be) {
     return [uint32](((($v -band 0xFF) -shl 24) -bor (($v -band 0xFF00) -shl 8) -bor (($v -band 0xFF0000) -shr 8) -bor (($v -band 0xFF000000) -shr 24)))
 }
 function U64-At($b, $o, $be) {
-    $lo = U32-At $b $o (-not $be)
-    $hi = U32-At $b ($o + 4) (-not $be)
+    # 大端时前 4 字节是高 32 位；小端时前 4 字节才是低 32 位
+    if ($be) {
+        $hi = U32-At $b $o $true
+        $lo = U32-At $b ($o + 4) $true
+    } else {
+        $lo = U32-At $b $o $false
+        $hi = U32-At $b ($o + 4) $false
+    }
     return ([uint64]$hi -shl 32) -bor [uint64]$lo
 }
 
@@ -535,6 +541,10 @@ function Cmd-Build($argv) {
                 $expectPath = ($pathOpts -contains $a)
             }
             $cmd = $parts -join ' '
+            # wsl.exe 默认不把 Windows 的环境变量带进 bash，密码按推荐方式放 env 的话
+            # 转发时会变成空串，所以这里显式前置进去
+            $wpass = Get-Pass $opt
+            if ($wpass) { $cmd = 'IPA_CERT_PASSWORD=' + (Q $wpass) + ' ' + $cmd }
             & wsl.exe bash -lc $cmd
             exit $LASTEXITCODE
         }
