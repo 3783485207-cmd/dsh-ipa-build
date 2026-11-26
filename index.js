@@ -1,7 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 
-const MANIFEST_URL = new URL("./plugin.json", import.meta.url);
+const MANIFEST_URL = new URL("./package.json", import.meta.url);
 let versionPromise;
 
 // 不能在这里 top-level await：宿主有可能是 require 进来的，同步加载才稳
@@ -70,3 +70,7 @@ function apply(ctx) {
   ctx.skills.registerProvider(() => provider);
 }
 export { apply, inject, name };
+
+// 有的加载器只认默认导出，带上更稳；根目录不能再放 plugin.json，
+// DSH 会先读那个文件当插件本体，它不是对象也不是函数，直接报 expect apply
+export default { name, apply, inject };

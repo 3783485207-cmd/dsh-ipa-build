@@ -22,7 +22,7 @@ $envFile = Join-Path $tc 'env.ps1'
 if ((Test-Path $envFile) -and -not $env:IPA_NO_ENV) { . $envFile }
 
 function Get-AppVersion {
-    $raw = Get-Content (Join-Path $root 'plugin.json') -Raw -Encoding UTF8
+    $raw = Get-Content (Join-Path $root 'package.json') -Raw -Encoding UTF8
     $m = [regex]::Match($raw, '"version"\s*:\s*"([^"]+)"')
     if ($m.Success) { $m.Groups[1].Value } else { '0.0.0' }
 }

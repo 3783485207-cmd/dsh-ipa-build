@@ -10,7 +10,7 @@ sdk="${IPA_SDK:-$tc/sdk/iPhoneOS16.5.sdk}"
 ldid="${IPA_LDID:-$tc/bin/ldid}"
 
 app_version() {
-  sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' "$root/plugin.json" 2>/dev/null | head -1
+  sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' "$root/package.json" 2>/dev/null | head -1
 }
 
 # 只判断 a 是否比 b 旧，输出 1/0。不用 sort -V：macOS 的 sort 没有这个开关。
