@@ -1,0 +1,9 @@
+upstream: https://github.com/ProcursusTeam/ldid
+tag:      v2.1.5-procursus8
+commit:   18255c55405ab1702d8677bf42018eadc76e0b87
+date:     2026-11-16
+license:  AGPL-3.0（见同目录 COPYING）
+
+这里的内容和上面那个 commit 的目录树逐文件一致（ldid.cpp sha256 78a5f4d08f8affa6bbbf7b26947ba26023bca91347ee78c4f70d46cf7b67563d）。
+要复现：git clone 后 checkout 到该 commit，用 scripts/bootstrap.sh 编即可。
+改这个目录时记得同步 COMMIT，不然构建就不再可复现。

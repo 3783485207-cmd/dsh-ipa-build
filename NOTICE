@@ -5,7 +5,7 @@ dsh-ipa-build
 
 vendor/ 下的第三方组件各自按自己的许可证分发，和上面的 MIT 无关：
 
-- vendor/ldid-master/  —— ldid，AGPL-3.0（见该目录下的 COPYING）。
+- vendor/ldid-master/  —— ldid v2.1.5-procursus8（ProcursusTeam/ldid，commit 18255c5），AGPL-3.0（见该目录下的 COPYING）。
   只在 Linux / macOS 上编译成 ~/.ipa-toolchain/bin/ldid 用于本地签名。
   你的分发行为若触发 AGPL 义务（例如对外提供修改后的 ldid 或其衍生作品），
   需自行履行 AGPL 的源码提供义务。

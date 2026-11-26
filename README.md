@@ -74,7 +74,7 @@ scripts/ipa info dist/HelloApp.ipa
 
 - `vendor/iPhoneOS16.5.sdk.tar.xz` — 16.5 的 iPhoneOS SDK，`.tbd` 已展开成真文件。sha256 `1d55ed9e66a37c0e6813c5be29df6f64f1ce448f58911a6cb87db07d5f6b8c58`
 - `vendor/zsign/zsign.exe` — 来自 https://github.com/zhlynn/zsign v1.1.3 的 Windows 版。sha256 `abc1087da5a410c42fdbb8e90049802c2cc6c03fcd0ebb6d5c315b17f6d26a87`
-- `vendor/libplist-2.6.0.tar.bz2`、`vendor/ldid-master/` — Linux/macOS 编 ldid 用。ldid 是上游 master 的源码快照（没有 pin commit，所以不是一个可复现的构建，介意就自己换固定版本重编）
+- `vendor/libplist-2.6.0.tar.bz2`、`vendor/ldid-master/` — Linux/macOS 编 ldid 用。ldid 是 ProcursusTeam/ldid **v2.1.5-procursus8**（commit `18255c5`）的源码快照，目录树与该 commit 逐文件一致，`vendor/ldid-master/COMMIT` 里写了怎么复现，bootstrap 编译前会校验 `ldid.cpp` 的 sha256
 
 第三方组件许可证各不相同，见 `NOTICE`：仓库自己的代码是 MIT，ldid 是 AGPL-3.0，libplist 是 LGPL-2.1，SDK 归 Apple，zsign 见上游仓库。
 

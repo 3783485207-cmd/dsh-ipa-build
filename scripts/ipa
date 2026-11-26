@@ -84,60 +84,87 @@ except Exception as e:
     print('读不了|%s' % e)
     sys.exit()
 
-def u32(b, o):
-    return struct.unpack('<I', b[o:o + 4])[0]
+def rd(off, n, endian):
+    fmt = ('>' if endian == 'be' else '<') + ('I' if n == 4 else 'Q')
+    return struct.unpack(fmt, data[off:off + n])[0]
 
-def sig_state(off):
-    magic = u32(data, off)
+def sig_state(base, _fat_endian=None):
+    # slice 自己的字节序看它自己的 magic，不能沿用 fat 头的字节序
+    raw = rd(base, 4, 'le')
+    if raw in (0xfeedfacf, 0xfeedface):
+        endian = 'le'
+    elif raw in (0xcefaedfe, 0xcffaedfe):
+        endian = 'be'
+    else:
+        return None
+    magic = rd(base, 4, endian)
     if magic == 0xfeedfacf:
         hsz = 32
     elif magic == 0xfeedface:
         hsz = 28
     else:
         return None
-    ncmds = u32(data, off + 16)
-    sizeofcmds = u32(data, off + 20)
-    pos, end = off + hsz, off + hsz + sizeofcmds
+    ncmds = rd(base + 16, 4, endian)
+    sizeofcmds = rd(base + 20, 4, endian)
+    if ncmds > 4096 or sizeofcmds > 1048576:
+        return None
+    pos, end = base + hsz, base + hsz + sizeofcmds
     sigoff = None
     while pos + 8 <= end and pos + 8 <= len(data):
-        cmd, size = u32(data, pos), u32(data, pos + 4)
+        cmd, size = rd(pos, 4, endian), rd(pos + 4, 4, endian)
         if size < 8:
             break
         if cmd == 0x1d and pos + 16 <= len(data):
-            sigoff = u32(data, pos + 8)
+            # dataoff 相对 slice 起点，fat 里要加上 base
+            sigoff = base + rd(pos + 8, 4, endian)
         pos += size
     if sigoff is None or sigoff + 12 > len(data):
         return None
-    if u32(data, sigoff) != 0xfade0cc0:
+    if rd(sigoff, 4, endian) != 0xfade0cc0:
         return None
-    count = u32(data, sigoff + 4)
-    types = []
-    for i in range(min(count, 20)):
-        types.append(u32(data, sigoff + 8 + i * 8))
+    count = rd(sigoff + 4, 4, endian)
+    types = [rd(sigoff + 8 + i * 8, 4, endian) for i in range(min(count, 20))]
     if 0x10000 in types:
         return 'cms'
     if 0 in types:
         return 'adhoc'
     return None
 
-magic = u32(data, 0)
+# 按“小端读出的值”判断：标准 fat 头是 CA FE BA BE，小端读出 0xBEBAFECA，字段按大端；
+# 0xCAFEBABE 是字节交换变体 FAT_CIGAM，字段按小端
+FAT = {
+    0xBEBAFECA: ('be', 20),
+    0xBFBAFECA: ('be', 32),
+    0xCAFEBABE: ('le', 20),
+    0xCAFEBABF: ('le', 32),
+}
+
+magic = rd(0, 4, 'le')
 archs = []
 sig = None
 if magic in (0xfeedface, 0xfeedfacf):
-    archs = [CPU.get(u32(data, 4), '?')]
-    sig = sig_state(0)
-elif magic in (0xcafebabe, 0xcafebabf):
-    nfat = u32(data, 4)
+    archs = [CPU.get(rd(4, 4, 'le'), '?')]
+    sig = sig_state(0, 'le')
+elif magic in (0xcefaedfe, 0xcffaedfe):
+    archs = [CPU.get(rd(4, 4, 'be'), '?')]
+    sig = sig_state(0, 'be')
+elif magic in FAT:
+    endian, entSize = FAT[magic]
+    nfat = rd(4, 4, endian)
     if nfat <= 20:
         for i in range(nfat):
-            e = 8 + i * (32 if magic == 0xcafebabf else 20)
-            if e + 8 > len(data):
+            e = 8 + i * entSize
+            if e + entSize > len(data):
                 break
-            archs.append(CPU.get(u32(data, e), '?'))
-            if sig is None:
-                off = struct.unpack('<Q' if magic == 0xcafebabf else '<I', data[e + 8:e + 16 if magic == 0xcafebabf else e + 12])[0]
-                if off < len(data):
-                    sig = sig_state(off)
+            archs.append(CPU.get(rd(e, 4, endian), '?'))
+            off = rd(e + 8, 8 if entSize == 32 else 4, endian)
+            if off < len(data):
+                st = sig_state(off)
+                # 多个切片取最强的那个：任一有 CMS 就是真证书签名
+                if st == 'cms' or (st and sig is None):
+                    sig = st
+    else:
+        archs = ['不是 Mach-O']
 else:
     archs = ['不是 Mach-O']
 
@@ -155,7 +182,8 @@ find_exe() {
   python3 - "$app" <<'PY' 2>/dev/null || true
 import os, struct, sys
 app = sys.argv[1]
-MAG = (0xfeedface, 0xfeedfacf, 0xcafebabe, 0xcafebabf)  # 32/64 位 Mach-O 和 fat
+# 32/64 位 Mach-O、标准 fat（小端读出 0xBEBAFECA）和字节交换变体
+MAG = (0xfeedface, 0xfeedfacf, 0xcefaedfe, 0xcffaedfe, 0xbebafeca, 0xbfbafeca, 0xcafebabe, 0xcafebabf)
 for name in sorted(os.listdir(app)):
     p = os.path.join(app, name)
     if not os.path.isfile(p):
@@ -163,8 +191,12 @@ for name in sorted(os.listdir(app)):
     try:
         head = open(p, 'rb').read(4)
         m = struct.unpack('<I', head)[0]
-        if m == 0xcafebabe and len(head) == 4:
-            # 0xcafebabe 也可能是 Java 类，看 nfat 是否像一个正常值
+        if m in (0xbebafeca, 0xbfbafeca):
+            nfat = struct.unpack('>I', open(p, 'rb').read(8)[4:8])[0]
+            if nfat > 20:
+                continue
+        elif m in (0xcafebabe, 0xcafebabf):
+            # 也可能是 Java 类，看 nfat 是否像一个正常值
             nfat = struct.unpack('<I', open(p, 'rb').read(8)[4:8])[0]
             if nfat > 20:
                 continue
@@ -223,7 +255,7 @@ cmd_info() {
   echo "版本     $ver build $build"
   echo "最低系统 $minos"
   if [ -z "$bid$ver$minos" ]; then
-    echo "plist    读不出字段，多半是二进制格式（bplist）——Xcode 产出的包都是这种，换 pack 或 resign 处理前先 plutil -convert xml1"
+    echo "plist    这几个键都读不出来：plist 可能损坏，也可能键名不是标准写法（bash 这边 bplist 本来就能读）"
   fi
   if [ -f "$t/$exe" ]; then
     local rep; rep="$(macho_report "$t/$exe")"

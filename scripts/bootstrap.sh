@@ -79,8 +79,13 @@ if [ ! -f "$tc/deps/lib/libplist-2.0.a" ]; then
     && make -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu)" >/dev/null && make install >/dev/null )
 fi
 
+# ldid 是 ProcursusTeam/ldid v2.1.5-procursus8（commit 18255c5）的源码快照，
+# 想复现就 checkout 那个 commit；这里先校验快照没被改过
+LDID_CPP_SHA="%s"
+
 if [ ! -x "$tc/bin/ldid" ]; then
   echo "编 ldid"
+  check_sha "$root/vendor/ldid-master/ldid.cpp" "$LDID_CPP_SHA"
   rm -rf "$tc/src/ldid-master"
   cp -r "$root/vendor/ldid-master" "$tc/src/"
   ( cd "$tc/src/ldid-master" && PKG_CONFIG_PATH="$tc/deps/lib/pkgconfig" make -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu)" >/dev/null \

@@ -53,41 +53,64 @@ function Cpu-Name($v) {
     }
 }
 
-# 解析 LC_CODE_SIGNATURE 和签名 SuperBlob：有 CMS 才是真证书签名
-function Get-SigState($fs, $off) {
-    $h = Read-At $fs $off 32
+# 二进制 plist / Mach-O 里到处是大端，.NET 默认按小端读，这里按需翻转
+function U32-At($b, $o, $be) {
+    $v = [BitConverter]::ToUInt32($b, $o)
+    if (-not $be) { return $v }
+    return [uint32](((($v -band 0xFF) -shl 24) -bor (($v -band 0xFF00) -shl 8) -bor (($v -band 0xFF0000) -shr 8) -bor (($v -band 0xFF000000) -shr 24)))
+}
+function U64-At($b, $o, $be) {
+    $lo = U32-At $b $o (-not $be)
+    $hi = U32-At $b ($o + 4) (-not $be)
+    return ([uint64]$hi -shl 32) -bor [uint64]$lo
+}
+
+# 解析 LC_CODE_SIGNATURE 和签名 SuperBlob：有 CMS 才是真证书签名。
+# slice 的字节序看它自己的 magic，不能沿用 fat 头的
+function Get-SigState($fs, $base) {
+    $m = Read-At $fs $base 4
+    if ($m -eq $null) { return '没签' }
+    $le = [BitConverter]::ToUInt32($m, 0)
+    if ($le -eq 4277009103 -or $le -eq 4277009102) { $be = $false }
+    elseif ($le -eq 3472551422 -or $le -eq 3489333246) { $be = $true }
+    else { return '没签' }
+    $h = Read-At $fs $base 32
     if ($h -eq $null) { return '没签' }
-    $mg = [BitConverter]::ToUInt32($h, 0)
-    if ($mg -eq 4277009103) { $hsz = 32 } elseif ($mg -eq 4277009102) { $hsz = 28 } else { return '没签' }
-    $ncmds = [BitConverter]::ToUInt32($h, 16)
-    $sizeofcmds = [BitConverter]::ToUInt32($h, 20)
+    $magic = U32-At $h 0 $be
+    if ($magic -eq 4277009103) { $hsz = 32 } elseif ($magic -eq 4277009102) { $hsz = 28 } else { return '没签' }
+    $ncmds = U32-At $h 16 $be
+    $sizeofcmds = U32-At $h 20 $be
     if ($ncmds -gt 4096 -or $sizeofcmds -gt 1048576) { return '没签' }
-    $cmds = Read-At $fs ($off + $hsz) $sizeofcmds
+    $cmds = Read-At $fs ($base + $hsz) $sizeofcmds
     if ($cmds -eq $null) { return '没签' }
     $sigoff = -1
     $pos = 0
     for ($i = 0; $i -lt $ncmds; $i++) {
         if ($pos + 8 -gt $sizeofcmds) { break }
-        $cmd = [BitConverter]::ToUInt32($cmds, $pos)
-        $size = [BitConverter]::ToUInt32($cmds, $pos + 4)
+        $cmd = U32-At $cmds $pos $be
+        $size = U32-At $cmds ($pos + 4) $be
         if ($size -lt 8) { break }
-        if ($cmd -eq 29 -and $pos + 16 -le $sizeofcmds) { $sigoff = [BitConverter]::ToUInt32($cmds, $pos + 8) }
+        # dataoff 相对 slice 起点，fat 里必须加 base
+        if ($cmd -eq 29 -and $pos + 16 -le $sizeofcmds) { $sigoff = $base + (U32-At $cmds ($pos + 8) $be) }
         $pos += $size
     }
     if ($sigoff -lt 0) { return '没签' }
     $sb = Read-At $fs $sigoff 12
-    if ($sb -eq $null -or [BitConverter]::ToUInt32($sb, 0) -ne 4208856256) { return '没签' }
-    $cnt = [BitConverter]::ToUInt32($sb, 4)
+    if ($sb -eq $null) { return '没签' }
+    if (U32-At $sb 0 $be -ne 4208856256) { return '没签' }
+    $cnt = U32-At $sb 4 $be
     if ($cnt -gt 20) { $cnt = 20 }
     $idx = Read-At $fs ($sigoff + 8) ($cnt * 8)
     if ($idx -eq $null) { return '没签' }
     for ($i = 0; $i -lt $cnt; $i++) {
-        if ([BitConverter]::ToUInt32($idx, $i * 8) -eq 0x10000) { return '真证书签名（有 CMS）' }
+        if ((U32-At $idx ($i * 8) $be) -eq 65536) { return '真证书签名（有 CMS）' }
     }
     return 'ad-hoc 伪签名（只有 CodeDirectory）'
 }
 
-# fat binary 的 offset 4 是 nfat_arch，不是 cputype
+# fat binary 的 offset 4 是 nfat_arch，不是 cputype；
+# 标准 fat 头是 CA FE BA BE（小端读出 3199925962），字段大端；
+# 3405691582/3405691583 是字节交换变体 FAT_CIGAM，字段小端
 function Get-MachReport($path) {
     $fs = $null
     try { $fs = [IO.File]::OpenRead($path) } catch { return @('读不了', '读不了', 0) }
@@ -97,20 +120,24 @@ function Get-MachReport($path) {
         $magic = [BitConverter]::ToUInt32($h, 0)
         $archs = @()
         $sig = '没签'
-        if ($magic -eq 4277009102 -or $magic -eq 4277009103) {
+        if ($magic -eq 4277009103 -or $magic -eq 4277009102) {
             $archs += (Cpu-Name ([BitConverter]::ToUInt32($h, 4)))
             $sig = Get-SigState $fs 0
-        } elseif ($magic -eq 3405691582 -or $magic -eq 3405691583) {
-            $nfat = [BitConverter]::ToUInt32($h, 4)
+        } elseif ($magic -eq 3472551422 -or $magic -eq 3489333246) {
+            $archs += (Cpu-Name (U32-At $h 4 $true))
+            $sig = Get-SigState $fs 0
+        } elseif ($magic -eq 3199925962 -or $magic -eq 3216703178 -or $magic -eq 3405691582 -or $magic -eq 3405691583) {
+            $be = ($magic -eq 3199925962 -or $magic -eq 3216703178)
+            $entSize = if ($magic -eq 3216703178 -or $magic -eq 3405691583) { 32 } else { 20 }
+            $nfat = U32-At $h 4 $be
             if ($nfat -gt 20) { $nfat = 0 }
-            $entSize = if ($magic -eq 3405691583) { 32 } else { 20 }
             for ($i = 0; $i -lt $nfat; $i++) {
                 $e = Read-At $fs (8 + $i * $entSize) $entSize
                 if ($e -eq $null) { continue }
-                $archs += (Cpu-Name ([BitConverter]::ToUInt32($e, 0)))
-                $off = if ($entSize -eq 32) { [BitConverter]::ToUInt64($e, 8) } else { [BitConverter]::ToUInt32($e, 8) }
+                $archs += (Cpu-Name (U32-At $e 0 $be))
+                $off = if ($entSize -eq 32) { U64-At $e 8 $be } else { U32-At $e 8 $be }
                 $st = Get-SigState $fs $off
-                if ($st -ne '没签') { $sig = $st }
+                if ($st -eq '真证书签名（有 CMS）' -or ($st -ne '没签' -and $sig -eq '没签')) { $sig = $st }
             }
         } else {
             $archs += '不是 Mach-O'
@@ -188,7 +215,8 @@ function Get-Exe($app) {
         $fs.Read($b, 0, 8) | Out-Null
         $fs.Close()
         $m = [BitConverter]::ToUInt32($b, 0)  # 64/32 位 Mach-O、fat 的魔数：64/32 位 Mach-O 或 fat
-        if ($m -eq 4277009103 -or $m -eq 4277009102 -or $m -eq 3405691582 -or $m -eq 3405691583 -or $m -eq 3199925962) { return $f.Name }
+        # 64/32 位 Mach-O（大小端）、标准 fat、CIGAM fat
+        if ($m -in @(4277009103, 4277009102, 3472551422, 3489333246, 3199925962, 3216703178, 3405691582, 3405691583)) { return $f.Name }
     }
     return $null
 }

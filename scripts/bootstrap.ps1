@@ -6,7 +6,10 @@ param(
     # 慢就自己挂代理，别换源
     [string[]]$LlvmUrl = @(
         'https://github.com/llvm/llvm-project/releases/download/llvmorg-18.1.8/clang+llvm-18.1.8-x86_64-pc-windows-msvc.tar.xz'
-    )
+    ),
+    # 上面那份 18.1.8 的 sha256，实测校验过（936MB，下完 tar -tJf 能完整列出）
+    # 换 URL 的话这个哈希也要跟着换，不然会被判成"文件不对"
+    [string]$LlvmSha = '22c5907db053026cc2a8ff96d21c0f642a90d24d66c23c6d28ee7b1d572b82e8'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -60,7 +63,9 @@ function Test-Archive($path) {
 
 function Get-LlvmArchive($dest) {
     $hashFile = Join-Path $tc 'llvm.sha256'
-    $expect = if (Test-Path $hashFile) { (Get-Content $hashFile -Raw).Trim() } else { $null }
+    $expect = if ($LlvmSha) { $LlvmSha.Trim().ToLower() }
+              elseif (Test-Path $hashFile) { (Get-Content $hashFile -Raw).Trim() }
+              else { $null }
     foreach ($u in $LlvmUrl) {
         Write-Host "下载编译器：$u"
         # 不带 --continue-at：不支持 Range 的源会把文件拼坏，重下整份更稳
@@ -70,9 +75,9 @@ function Get-LlvmArchive($dest) {
         if (-not (Test-Archive $dest)) { Write-Host "下下来的包解不开，当没下成（多半是没下全或者被换过）"; Remove-Item $dest -Force; continue }
         $sha = Get-FileSha256 $dest
         Write-Host "sha256 $sha"
-        # 上游只发 GPG 签名，没有官方 sha256；所以第一次下完把哈希记下来，
-        # 以后每次下载都跟它比对，换文件立刻能发现
-        if ($expect -and $sha -ne $expect) { Write-Host "sha256 跟上次记的不一样（上次 $expect），这个文件不对，停下"; Remove-Item $dest -Force; continue }
+        # 上游只发 GPG 签名、没有官方 sha256，所以这里用实测过的固定哈希做锚点：
+        # 只要不是这个值就直接拒绝，第一次下载也不会盲信
+        if ($expect -and $sha -ne $expect) { Write-Host "sha256 对不上（应为 $expect，实际 $sha），文件被换过或没下全，丢掉重试"; Remove-Item $dest -Force; continue }
         if (-not $expect) { Set-Content -Path $hashFile -Value $sha -Encoding utf8 }
         return $true
     }
