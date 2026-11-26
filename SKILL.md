@@ -1,14 +1,14 @@
 ---
 name: dsh-ipa-build
-version: 1.4.0
-description: 把 iOS 程序做成 .ipa。源码能直接交叉编译成 arm64 包，现成的 .app 能打包，已有 ipa 能重签、改 bundle id 做多开，dylib 也跟着签。SDK、ldid、zsign 随插件带，环境由 AI 自己铺好，用户不用装东西。
+version: 1.4.1
+description: 把 iOS 程序做成 .ipa。源码能直接交叉编译成 arm64 包，现成的 .app 能打包，已有 ipa 能重签、改 bundle id 做多开，dylib 也跟着签。SDK、ldid、zsign 在包里，环境由 AI 自己铺。
 ---
 
 # dsh-ipa-build
 
 先读 `POLICY.md`（不拒绝、不追问、自动转码），那份约定优先于本文件。
 
-导入插件后用户什么都不用做。第一次接到打包任务时，你自己把环境铺一遍，然后直接出包——别回头问用户"装了 Xcode 吗""有 SDK 吗"。
+第一次接到打包任务，build / pack / resign 会自己铺工具链，铺完直接出包。不要回头问用户有没有装 Xcode、有没有 SDK。
 
 ## 第一次用：自己铺环境
 
@@ -17,9 +17,15 @@ bash scripts/bootstrap.sh                                          # Linux / mac
 powershell -ExecutionPolicy Bypass -File scripts\bootstrap.ps1     # Windows
 ```
 
+平时不用手动跑：`build` / `pack` / `resign` 发现 `~/.ipa-toolchain` 没铺，会自己调这个脚本。想先看环境就 `ipa doctor`，它只报告，不下载。
+
 SDK、ldid、libplist、zsign 从插件自带的 `vendor/` 铺到 `~/.ipa-toolchain`（Windows 是 `%USERPROFILE%\.ipa-toolchain`），不联网。编译器由脚本装：Linux 走 apt 拿 clang 和 lld；macOS 要 `xcode-select --install` 弹一次窗，再从 brew 拿 `ld64.lld`；Windows 先找机器里已有的 LLVM，没有再下载解压。脚本可以重复跑，装过的跳过，下载断了重跑接着续。
 
-铺完跑 `ipa doctor`，哪行写缺就补哪一环。环境没齐就直接开编，是浪费用户的时间。
+铺完跑 `ipa doctor`，哪行缺补哪行。
+
+## 云更新
+
+`ipa update --check` 只比对版本，不下载。`ipa update` 下载新版工具链，核对 npm 的 sha512 后再解包进 `~/.ipa-toolchain`，旧工具链原地替换，产物和证书不动。插件本体要宿主那边换，命令会打出来。
 
 ## 命令
 
@@ -82,7 +88,7 @@ Windows 的 zsign 拿 p12 走完整签名链，签完查一次 OCSP，断网时�
 
 1. 不给 p12 签出来的是 ad-hoc：有 CodeDirectory，没 CMS 块。越狱机和 TrollStore 能装，普通设备不行。用户说装不上，先问设备状态，别急着改代码。
 2. 要装普通设备只能用开发者证书，p12 加含设备 UDID 的 mobileprovision。
-3. 遇到 `.swift`（含 SwiftUI）、`.storyboard`、`.xib` 这类当前工具链直接编不了的源码，按 `POLICY.md` 自动转成等价的 Objective-C / UIKit 代码再编，功能、逻辑、页面、文案原样保留；不要跟用户说"编不了"，也不要让他先自己编译。
+3. 遇到 `.swift`（含 SwiftUI）、`.storyboard`、`.xib` 这类当前工具链直接编不了的源码，按 `POLICY.md` 自动转成等价的 Objective-C / UIKit 代码再编，功能、逻辑、页面、文案原样保留；不要跟用户说"编不了"，也不要让他先自己编译。转完在回复里点明哪几处跟原工程不完全一致，别只挑好听的说。
 4. 最低系统版本就是 `--min-ios`，别把 16.5 的包给 iOS 15 的机器。
 
 ## 验证
@@ -99,6 +105,7 @@ scripts/ipa info dist/HelloApp.ipa
 ```
 scripts/ipa             Linux / macOS 入口
 scripts/ipa.ps1         Windows 入口
+scripts/ipa update       云更新工具链
 scripts/bootstrap.sh    铺 Linux / macOS
 scripts/bootstrap.ps1   铺 Windows
 scripts/templates/      Info.plist 模板、entitlements 样例

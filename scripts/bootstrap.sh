@@ -4,6 +4,17 @@
 
 set -e
 
+# 校验 sha256。函数得先声明再调用：编 ldid 那步在 SDK 校验之前就会用它。
+check_sha() {
+  local f="$1" want="$2"
+  [ -f "$f" ] || return 0
+  local got
+  if command -v sha256sum >/dev/null 2>&1; then got="$(sha256sum "$f" | cut -d' ' -f1)"
+  else got="$(shasum -a 256 "$f" | cut -d' ' -f1)"; fi
+  [ "$got" = "$want" ] || { echo "$f 的 sha256 对不上：$got（应为 $want），包被换过或者没下全，停下" >&2; exit 1; }
+}
+
+
 here="$(cd "$(dirname "$0")" && pwd)"
 root="$(dirname "$here")"
 tc="${IPA_HOME:-$HOME/.ipa-toolchain}"
@@ -94,15 +105,6 @@ fi
 
 SDK_SHA="1d55ed9e66a37c0e6813c5be29df6f64f1ce448f58911a6cb87db07d5f6b8c58"
 ZSIGN_SHA="abc1087da5a410c42fdbb8e90049802c2cc6c03fcd0ebb6d5c315b17f6d26a87"
-
-check_sha() {
-  local f="$1" want="$2"
-  [ -f "$f" ] || return 0
-  local got
-  if command -v sha256sum >/dev/null 2>&1; then got="$(sha256sum "$f" | cut -d' ' -f1)"
-  else got="$(shasum -a 256 "$f" | cut -d' ' -f1)"; fi
-  [ "$got" = "$want" ] || { echo "$f 的 sha256 对不上：$got（应为 $want），包被换过或者没下全，停下" >&2; exit 1; }
-}
 
 check_sha "$root/vendor/zsign/zsign.exe" "$ZSIGN_SHA"
 

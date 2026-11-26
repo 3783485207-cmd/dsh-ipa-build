@@ -21,6 +21,28 @@ if ($env:IPA_ZSIGN) { $zsign = $env:IPA_ZSIGN }
 $envFile = Join-Path $tc 'env.ps1'
 if ((Test-Path $envFile) -and -not $env:IPA_NO_ENV) { . $envFile }
 
+function Get-AppVersion {
+    $raw = Get-Content (Join-Path $root 'plugin.json') -Raw -Encoding UTF8
+    $m = [regex]::Match($raw, '"version"\s*:\s*"([^"]+)"')
+    if ($m.Success) { $m.Groups[1].Value } else { '0.0.0' }
+}
+
+# 工具链没铺过就自己铺。SDK 和 zsign 都在 vendor 里，不联网；编译器那一步要下载，失败会自己报出来。
+function Ensure-Toolchain {
+    # 只看 SDK 有没有铺。env.ps1 是找编译器成功后才写的，拿它当判据会导致
+    # 没编译器的机器每次出包都重跑一遍 bootstrap
+    $sdkDir = Join-Path $tc 'sdk/iPhoneOS16.5.sdk'
+    if (Test-Path $sdkDir) { return }
+    Write-Host '工具链还没铺，先装一次（只装一次，之后走缓存）'
+    $boot = Join-Path $here 'bootstrap.ps1'
+    if (-not (Test-Path $boot)) { Die '找不到 scripts\bootstrap.ps1，插件不完整' }
+    & $boot
+    if (-not (Test-Path $sdkDir)) { Die '铺环境失败，看上面的报错' }
+    # bootstrap 在子进程里改 PATH，回到这边就没了；env.ps1 是它写下的最终状态
+    $envFile = Join-Path $tc 'env.ps1'
+    if (Test-Path $envFile) { . $envFile }
+}
+
 function Die($m) { Write-Host $m; exit 1 }
 
 function Test-Bplist($path) {
@@ -337,6 +359,8 @@ function Fw-Args($map, $src) {
 }
 
 function Cmd-Doctor {
+    Write-Host ("版本      " + (Get-AppVersion))
+    Write-Host ("工具链    " + $(if (Test-Path (Join-Path $tc 'sdk/iPhoneOS16.5.sdk')) { $tc } else { '缺（build 会自动装，也可以手动跑 scripts\bootstrap.ps1' }))
     $clang = Get-Command clang.exe -ErrorAction SilentlyContinue
     $lld = Get-Command ld64.lld.exe -ErrorAction SilentlyContinue
     $wsl = Get-Command wsl.exe -ErrorAction SilentlyContinue
@@ -591,6 +615,56 @@ function Cmd-Build($argv) {
     Write-Host "产物 $out"
 }
 
+
+# 云更新：直接从 npm 拿新版本的工具链铺进现有的 %USERPROFILE%\.ipa-toolchain，
+# 不用重装插件。SDK / zsign 一起换。
+function Cmd-Update([string]$mode) {
+    $cur = Get-AppVersion
+    try { $meta = Invoke-RestMethod -Uri 'https://registry.npmjs.org/dsh-ipa-build/latest' -TimeoutSec 20 }
+    catch { Die '查 npm 没通，网络问题，稍后再试' }
+    $lat = $meta.version
+    if (-not $lat) { Die 'npm 的返回里解析不出版本号' }
+    Write-Host "插件 $cur，npm 上 $lat"
+    if ($cur -eq $lat) { Write-Host '已经是最新'; return }
+    try { $cmp = [version]$lat -gt [version]$cur } catch { $cmp = $false }
+    if (-not $cmp) { Write-Host "本地比 npm 上的新（$cur），不动它"; return }
+    if ($mode -eq '--check') {
+        Write-Host "有新版本: $lat"
+        Write-Host '工具链更新: scripts\ipa.ps1 update'
+        Write-Host "插件本体更新: dsh plugin add dsh-ipa-build@$lat"
+        return
+    }
+
+    $tgz = Join-Path $tc "dsh-ipa-build-$lat.tgz"
+    New-Item -ItemType Directory -Path $tc -Force | Out-Null
+    Write-Host "下载 $lat"
+    & curl.exe -fsSL --max-time 900 -o $tgz $meta.dist.tarball
+    if ($LASTEXITCODE -ne 0) { Die '下载没成，重跑一次会接着来' }
+    if ($meta.dist.integrity) {
+        $hex = (Get-FileHash -Path $tgz -Algorithm SHA512).Hash.ToLower()
+        $bytes = New-Object byte[] ([int]($hex.Length / 2))
+        for ($i = 0; $i -lt $bytes.Length; $i++) { $bytes[$i] = [Convert]::ToByte($hex.Substring($i * 2, 2), 16) }
+        $got = 'sha512-' + [Convert]::ToBase64String($bytes)
+        if ($got -ne $meta.dist.integrity) { Remove-Item $tgz -Force; Die '包和 npm 上的哈希对不上，停了' }
+        Write-Host '哈希核对通过'
+    }
+    $dir = Join-Path $tc "pkg/$lat"
+    if (Test-Path $dir) { Remove-Item $dir -Recurse -Force }
+    New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    & tar.exe -xzf $tgz -C $dir --strip-components=1
+    if ($LASTEXITCODE -ne 0) { Die '解包失败' }
+    Write-Host '换工具链'
+    $old = $env:IPA_HOME
+    $env:IPA_HOME = $tc
+    & (Join-Path $dir 'scripts/bootstrap.ps1')
+    $env:IPA_HOME = $old
+    if (-not (Test-Path (Join-Path $tc 'sdk/iPhoneOS16.5.sdk'))) { Die '工具链没换完，旧的那套还在，能继续用' }
+    Set-Content -Path (Join-Path $tc 'VERSION') -Value $lat -Encoding UTF8
+    Remove-Item $tgz -Force -ErrorAction SilentlyContinue
+    Write-Host "工具链已到 $lat"
+    Write-Host "插件本体还需要宿主换：dsh plugin add dsh-ipa-build@$lat"
+}
+
 if ($args.Count -eq 0) {
     Write-Host "ipa-build —— Windows 上打包 / 签名 iOS 安装包"
     Write-Host ""
@@ -599,14 +673,16 @@ if ($args.Count -eq 0) {
     Write-Host "  pack     .app 打成 ipa，可改标识/显示名/版本/图标"
     Write-Host "  resign   已有的 ipa 或 app 重新签名，可换标识；给 --p12 就是真证书签名"
     Write-Host "  build    .m/.c 编成 ipa，需要 clang + SDK，没有就借 WSL"
+    Write-Host "  update   从 npm 拉新版本，热更新工具链（ipa.ps1 update --check 只看不装）"
     exit 0
 }
 
 switch ($args[0]) {
     'doctor' { Cmd-Doctor }
     'info'   { if ($args.Count -gt 1) { Cmd-Info $args[1] } else { Cmd-Info $null } }
-    'build'  { Cmd-Build @(Rest $args) }
-    'pack'   { Cmd-Pack @(Rest $args) }
-    'resign' { Cmd-Resign @(Rest $args) }
+    'build'  { Ensure-Toolchain; Cmd-Build @(Rest $args) }
+    'pack'   { Ensure-Toolchain; Cmd-Pack @(Rest $args) }
+    'resign' { Ensure-Toolchain; Cmd-Resign @(Rest $args) }
+    'update' { Cmd-Update $(if ($args.Count -gt 1) { $args[1] } else { '' }) }
     default  { Write-Host "不认识的命令: $($args[0])"; exit 1 }
 }

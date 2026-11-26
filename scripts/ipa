@@ -3,13 +3,39 @@
 set -e
 
 here="$(cd "$(dirname "$0")" && pwd)"
+root="$(dirname "$here")"
 tc="${IPA_HOME:-$HOME/.ipa-toolchain}"
 [ -f "$tc/env.sh" ] && . "$tc/env.sh"
 sdk="${IPA_SDK:-$tc/sdk/iPhoneOS16.5.sdk}"
 ldid="${IPA_LDID:-$tc/bin/ldid}"
 
+app_version() {
+  sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' "$root/plugin.json" 2>/dev/null | head -1
+}
+
+# 只判断 a 是否比 b 旧，输出 1/0。不用 sort -V：macOS 的 sort 没有这个开关。
+version_lt() {
+  awk -v a="$1" -v b="$2" 'BEGIN{
+    n=split(a,x,"."); m=split(b,y,".");
+    for(i=1;i<=4;i++){ p=x[i]+0; q=y[i]+0;
+      if(p<q){print 1; exit} if(p>q){print 0; exit} }
+    print 0
+  }'
+}
+
+# 工具链没铺过就自己铺，不等用户跑 bootstrap。SDK/ldid/zsign 全在 vendor 里，不联网；
+# 编译器那一步要联网或要 sudo，失败会让 bootstrap 自己报，不在这里吞掉。
+ensure_toolchain() {
+  [ -d "$sdk" ] && [ -x "$ldid" ] && [ -f "$tc/env.sh" ] && return 0
+  echo "工具链还没铺，先装一次（只装一次，之后走缓存）" >&2
+  bash "$root/scripts/bootstrap.sh" >&2 || die "铺环境失败，见上面的报错"
+  [ -f "$tc/env.sh" ] && . "$tc/env.sh"
+  sdk="${IPA_SDK:-$tc/sdk/iPhoneOS16.5.sdk}"
+  ldid="${IPA_LDID:-$tc/bin/ldid}"
+}
+
 die() { echo "$*" >&2; exit 1; }
-need_ldid() { [ -x "$ldid" ] || die "没找到 ldid，先跑 scripts/bootstrap.sh"; }
+need_ldid() { [ -x "$ldid" ] || die "没找到 ldid。跑 scripts/bootstrap.sh 编一下，出包时也会自动铺"; }
 need_py() { command -v python3 >/dev/null || die "缺 python3，改 plist 要用它（bootstrap 不装系统包，请自行 apt/dnf/pacman 装）"; }
 
 zsign_bin() {
@@ -230,6 +256,8 @@ find_app() {
 }
 
 cmd_doctor() {
+  printf '%-9s %s\n' 版本 "$(app_version)"
+  printf '%-9s %s\n' 工具链 "$([ -f "$tc/env.sh" ] && echo "$tc" || echo "没铺（出包时会自动装，或先跑 scripts/bootstrap.sh）")"
   local v
   v="$(command -v clang >/dev/null 2>&1 && clang --version 2>/dev/null | head -1 | sed 's/.*version //' || echo 缺)"
   printf '%-9s %s\n' clang "$v"
@@ -289,7 +317,7 @@ cmd_build() {
   local src="${1:-}"; [ -n "$src" ] || die "用法: ipa build 源码目录 --name 名字 --bundle-id com.a.b"
   shift
   [ -d "$src" ] || die "没有这个目录: $src"
-  command -v clang >/dev/null || die "没有 clang，先跑 scripts/bootstrap.sh"
+  command -v clang >/dev/null || die "没有 clang。跑 scripts/bootstrap.sh 装（Linux 走 apt，macOS 走 xcode-select + brew），装完再编"
   [ -d "$sdk" ] || die "没有 SDK，先跑 scripts/bootstrap.sh"
 
   local name="" bid="com.example.app" minios="14.0" ent="" icon="" out="" fw=()
@@ -550,15 +578,70 @@ cmd_resign() {
   echo "产物 $out"
 }
 
+# 云更新：不用重装插件，直接从 npm 拿新版本的工具链，铺进现有的 ~/.ipa-toolchain。
+# SDK、ldid、zsign 跟着换，用户已有的产物和证书不受影响。
+cmd_update() {
+  local mode="apply"
+  [ "${1:-}" = "--check" ] && mode="check"
+  local cur lat
+  cur="$(app_version)"; [ -n "$cur" ] || cur="0.0.0"
+  command -v curl >/dev/null 2>&1 || die "没有 curl，查不了新版"
+  local meta
+  meta="$(curl -fsSL --max-time 20 https://registry.npmjs.org/dsh-ipa-build/latest)" || die "查 npm 没通，网络问题，稍后再试"
+  lat="$(printf '%s' "$meta" | sed -n 's/.*"version":"\([^"]*\)".*/\1/p' | head -1)"
+  [ -n "$lat" ] || die "npm 的返回里解析不出版本号"
+  echo "插件 $cur，npm 上 $lat"
+  if [ "$cur" = "$lat" ]; then echo "已经是最新"; return 0; fi
+  if [ "$(version_lt "$cur" "$lat")" != "1" ]; then
+    echo "本地比 npm 上的新（$cur），不动它"; return 0
+  fi
+  if [ "$mode" = "check" ]; then
+    echo "有新版本: $lat"
+    echo "工具链更新: scripts/ipa update"
+    echo "插件本体更新: dsh plugin add dsh-ipa-build@$lat"
+    return 0
+  fi
+
+  local url integ
+  url="$(printf '%s' "$meta" | sed -n 's/.*"tarball":"\([^"]*\)".*/\1/p' | head -1)"
+  integ="$(printf '%s' "$meta" | sed -n 's/.*"integrity":"\([^"]*\)".*/\1/p' | head -1)"
+  [ -n "$url" ] || die "npm 没给 tarball 地址"
+  local tgz="$tc/dsh-ipa-build-$lat.tgz"
+  mkdir -p "$tc"
+  echo "下载 $lat"
+  curl -fsSL --max-time 900 -o "$tgz" "$url" || die "下载没成，重跑一次会接着来"
+  if [ -z "$integ" ]; then
+    echo "npm 没给 integrity，跳过哈希核对" >&2
+  elif ! command -v openssl >/dev/null 2>&1; then
+    echo "这台机器没有 openssl，跳过哈希核对（装一个再更新更稳）" >&2
+  else
+    local got
+    got="sha512-$(openssl dgst -sha512 -binary "$tgz" | openssl base64 -A)"
+    [ "$got" = "$integ" ] || { rm -f "$tgz"; die "包和 npm 上的哈希对不上，停了"; }
+    echo "哈希核对通过"
+  fi
+  local dir="$tc/pkg/$lat"
+  rm -rf "$dir"; mkdir -p "$dir"
+  tar -xzf "$tgz" -C "$dir" --strip-components=1 || die "解包失败"
+  echo "换工具链"
+  IPA_HOME="$tc" bash "$dir/scripts/bootstrap.sh" || die "工具链没换完，旧的那套还在，能继续用"
+  printf '%s\n' "$lat" > "$tc/VERSION"
+  rm -f "$tgz"
+  echo "工具链已到 $lat"
+  echo "插件本体还需要宿主换：dsh plugin add dsh-ipa-build@$lat"
+}
+
 case "${1:-}" in
   doctor) cmd_doctor;;
   info) shift; cmd_info "$@";;
-  build) cmd_build "$@";;
-  pack) cmd_pack "$@";;
-  resign) cmd_resign "$@";;
+  build) ensure_toolchain; cmd_build "$@";;
+  pack) ensure_toolchain; cmd_pack "$@";;
+  resign) ensure_toolchain; cmd_resign "$@";;
+  update) shift; cmd_update "$@";;
   *) sed -n '2p' "$0"; echo; echo "  doctor   看环境齐不齐"
      echo "  info     看 ipa/app 的标识、版本、架构、签没签"
      echo "  build    .m/.c 编成 ipa，需要 clang 和 SDK"
      echo "  pack     .app 打成 ipa，可改标识/显示名/版本/图标"
-     echo "  resign   已有的 ipa 或 app 重签，可换标识";;
+     echo "  resign   已有的 ipa 或 app 重签，可换标识"
+     echo "  update   从 npm 拉新版本，热更新工具链（\"ipa update --check\" 只看不装）";;
 esac
