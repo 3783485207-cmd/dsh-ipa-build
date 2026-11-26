@@ -18,7 +18,13 @@ powershell -ExecutionPolicy Bypass -File scripts\bootstrap.ps1
 
 东西都落在 `~/.ipa-toolchain`（Windows 是 `%USERPROFILE%\.ipa-toolchain`）。脚本可以反复跑，装过的跳过。
 
-SDK、ldid、libplist、zsign 都在 `vendor/`，这几个不用联网。编译器脚本自己解决：Linux 上走 apt，Windows 上先找机器里已有的 LLVM（PATH、Program Files、winget 装过的位置都找），没有就自己下载解压到工具链目录，断了下重跑会接着下。装完把路径写进用户的 PATH，下次开终端 `doctor` 就能看到。你不需要手动装任何东西。
+SDK、ldid、libplist、zsign 都在 `vendor/`，这几个不用联网。编译器脚本自己解决：
+
+- Linux：apt 装 clang 和 lld
+- macOS：先用 `xcode-select --install` 装命令行工具（系统会弹一次确认框，点掉就行），再从 brew 装 llvm 拿 `ld64.lld`
+- Windows：先找机器里已有的 LLVM（PATH、Program Files、winget 装过的位置），没有就自己下载解压到工具链目录，断了重跑会接着下
+
+装完路径都写进 `~/.ipa-toolchain/env.sh` 或用户 PATH，`doctor` 能看到。除了 macOS 那个系统弹窗，不需要你动手装别的东西。
 
 ## 用
 

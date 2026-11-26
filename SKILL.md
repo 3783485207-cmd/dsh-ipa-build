@@ -30,7 +30,7 @@ powershell -ExecutionPolicy Bypass -File scripts\bootstrap.ps1
 
 得先看清楚机器，别一条命令下去才发现编不了。
 
-**Linux / macOS**：`build`、`pack`、`resign`、`info` 全都能用。前提是 bootstrap 已经把 clang 和 ld64.lld 装上（Linux 上是从 apt 拿的 clang + lld）。
+**Linux / macOS**：`build`、`pack`、`resign`、`info` 全都能用。前提是 bootstrap 已经把 clang 和 ld64.lld 装上：Linux 从 apt 拿 clang + lld；macOS 先装 Xcode 命令行工具（系统弹窗确认一次），再从 brew 装 llvm 取 `ld64.lld`。
 
 **Windows**：`pack`、`resign`、`info` 一定能用，靠的是插件里带的 zsign.exe 和 .NET 自带的 zip。`build` 要看有没有 clang：
 

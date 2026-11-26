@@ -11,22 +11,49 @@ tc="${IPA_HOME:-$HOME/.ipa-toolchain}"
 mkdir -p "$tc/bin" "$tc/sdk" "$tc/src" "$tc/deps"
 echo "装到 $tc"
 
-if ! command -v clang >/dev/null 2>&1; then
-  echo "缺 clang，从 apt 装（源换清华镜像，国内快一点）"
-  if [ -f /etc/apt/sources.list ] && ! grep -q tuna /etc/apt/sources.list; then
-    sudo sed -i 's|http://archive.ubuntu.com/ubuntu/|https://mirrors.tuna.tsinghua.edu.cn/ubuntu/|g' /etc/apt/sources.list
-    sudo sed -i 's|http://security.ubuntu.com/ubuntu/|https://mirrors.tuna.tsinghua.edu.cn/ubuntu/|g' /etc/apt/sources.list
-  fi
-  sudo mkdir -p /var/lib/apt/lists/partial
-  sudo apt-get update -qq || true
-  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq clang lld
-fi
+os="$(uname -s)"
 
-# clang 调 ld64.lld 时按这个名字找，系统装的是带版本号的文件，做个软链接
-if ! command -v ld64.lld >/dev/null 2>&1; then
-  real="$(ls /usr/bin/ld64.lld-* 2>/dev/null | head -1)"
-  [ -n "$real" ] || { echo "装了 clang 但没 lld，运行: sudo apt install lld"; exit 1; }
-  sudo ln -sf "$real" /usr/local/bin/ld64.lld
+if [ "$os" = "Darwin" ]; then
+  if ! command -v clang >/dev/null 2>&1; then
+    echo "缺 Xcode 命令行工具，开始装（系统会弹一个确认框，点一下就行）"
+    xcode-select --install >/dev/null 2>&1 || true
+    for _ in 1 2 3 4 5 6 7 8; do
+      command -v clang >/dev/null 2>&1 && break
+      sleep 15
+    done
+    command -v clang >/dev/null 2>&1 || { echo "命令行工具还在装，装完再跑一次这个脚本"; exit 1; }
+  fi
+
+  # Apple 自带的 clang 不带 ld64.lld，得用 brew 的 llvm
+  if ! command -v ld64.lld >/dev/null 2>&1; then
+    if ! command -v brew >/dev/null 2>&1; then
+      echo "没有 Homebrew，先装一个"
+      /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" ||         { echo "Homebrew 没装上（网络问题），装完再跑一次"; exit 1; }
+    fi
+    echo "装 llvm，里面有 ld64.lld，几百 MB，等一下"
+    brew install llvm
+    prefix="$(brew --prefix llvm 2>/dev/null || true)"
+    [ -n "${prefix:-}" ] || { echo "brew 装完找不到 llvm 目录"; exit 1; }
+    ln -sf "$prefix/bin/ld64.lld" "$tc/bin/ld64.lld"
+  fi
+else
+  if ! command -v clang >/dev/null 2>&1; then
+    echo "缺 clang，从 apt 装（源换清华镜像，国内快一点）"
+    if [ -f /etc/apt/sources.list ] && ! grep -q tuna /etc/apt/sources.list; then
+      sudo sed -i 's|http://archive.ubuntu.com/ubuntu/|https://mirrors.tuna.tsinghua.edu.cn/ubuntu/|g' /etc/apt/sources.list
+      sudo sed -i 's|http://security.ubuntu.com/ubuntu/|https://mirrors.tuna.tsinghua.edu.cn/ubuntu/|g' /etc/apt/sources.list
+    fi
+    sudo mkdir -p /var/lib/apt/lists/partial
+    sudo apt-get update -qq || true
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq clang lld
+  fi
+
+  # clang 调 ld64.lld 时按这个名字找，系统装的是带版本号的文件，做个软链接
+  if ! command -v ld64.lld >/dev/null 2>&1; then
+    real="$(ls /usr/bin/ld64.lld-* /usr/lib/llvm-*/bin/ld64.lld 2>/dev/null | head -1)"
+    [ -n "$real" ] || { echo "装了 clang 但没 lld，运行: sudo apt install lld"; exit 1; }
+    sudo ln -sf "$real" /usr/local/bin/ld64.lld
+  fi
 fi
 
 if [ ! -f "$tc/deps/lib/libplist-2.0.a" ]; then
@@ -61,6 +88,7 @@ cat > "$tc/env.sh" <<EOF
 export IPA_HOME="$tc"
 export IPA_SDK="$tc/sdk/iPhoneOS16.5.sdk"
 export IPA_LDID="$tc/bin/ldid"
+export PATH="$tc/bin:$PATH"
 export LD_LIBRARY_PATH="$tc/deps/lib:\${LD_LIBRARY_PATH:-}"
 EOF
 
