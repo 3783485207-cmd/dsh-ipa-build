@@ -1,0 +1,161 @@
+#!/usr/bin/env bash
+# ipa —— 「产出 IPA」插件主程序
+#   ./ipa doctor                    检查工具链
+#   ./ipa install-sdk <sdk.tar.xz>  安装 / 替换 iOS SDK
+#   ./ipa build <源码目录> [选项]    编译源码并产出 .ipa
+#   ./ipa pack <已有.app目录> [-o 输出.ipa]  把现成 .app 打包成 .ipa
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TC="${IPA_HOME:-$HOME/.ipa-toolchain}"
+[ -f "$TC/env.sh" ] && . "$TC/env.sh"
+SDK="${IPA_SDK:-$TC/sdk/iPhoneOS16.5.sdk}"
+LDID="${IPA_LDID:-$TC/bin/ldid}"
+
+die() { printf '\033[1;31m[错误]\033[0m %s\n' "$*" >&2; exit 1; }
+info(){ printf '\033[1;34m[ipa]\033[0m %s\n' "$*"; }
+ok()  { printf '\033[1;32m[ ok]\033[0m %s\n' "$*"; }
+
+cmd_doctor() {
+  local bad=0
+  printf '%-28s' "clang";        command -v clang   >/dev/null && echo "$(clang --version|head -1|sed 's/.*version //')" || { echo "缺失"; bad=1; }
+  printf '%-28s' "ld64.lld";     command -v ld64.lld>/dev/null && echo "有" || { echo "缺失（clang -fuse-ld=lld 需要）"; bad=1; }
+  printf '%-28s' "iPhoneOS SDK"; [ -d "$SDK" ] && echo "$SDK" || { echo "缺失：$SDK"; bad=1; }
+  printf '%-28s' "ldid";         [ -x "$LDID" ] && echo "$LDID" || { echo "缺失：$LDID"; bad=1; }
+  printf '%-28s' "libplist";     ls "$TC"/deps/lib/libplist-2.0.* >/dev/null 2>&1 && echo "有" || { echo "缺失"; bad=1; }
+  printf '%-28s' "zip";          command -v zip >/dev/null && echo "有" || { echo "缺失"; bad=1; }
+  if [ "$bad" = 0 ]; then ok "工具链完整，可以构建"; else die "工具链不完整，先跑 ./install.sh"; fi
+}
+
+cmd_install_sdk() {
+  local pkg="${1:-}"; [ -n "$pkg" ] || die "用法: ./ipa install-sdk <iPhoneOS*.sdk.tar.xz>"
+  [ -f "$pkg" ] || die "找不到文件: $pkg"
+  mkdir -p "$TC/sdk"
+  info "解压 SDK → $TC/sdk"
+  tar -xJf "$pkg" -C "$TC/sdk"
+  ok "完成。当前 SDK 目录：$(ls -d "$TC"/sdk/*.sdk | head -1)"
+}
+
+# ---- 把 .app 目录打成 .ipa ----
+cmd_pack() {
+  local app="${1:-}"; shift || true
+  local out=""
+  while [ $# -gt 0 ]; do case "$1" in -o|--output) out="$2"; shift 2;; *) shift;; esac; done
+  [ -n "$app" ] || die "用法: ./ipa pack <Xxx.app> [-o 输出.ipa]"
+  [ -d "$app" ] || die "不是目录: $app"
+  local name; name="$(basename "$app" .app)"
+  local exec="$app/$(/usr/bin/plutil -extract CFBundleExecutable raw -o - "$app/Info.plist" 2>/dev/null || echo "$name")"
+
+  if [ -x "$LDID" ] && [ -f "$exec" ]; then
+    info "ldid 签名: $(basename "$exec")"
+    "$LDID" -S ${ENTITLEMENTS:+-S"$ENTITLEMENTS"} "$exec" >/dev/null 2>&1 || "$LDID" -S "$exec"
+  fi
+  [ -n "$out" ] || out="$ROOT/dist/$name.ipa"
+  mkdir -p "$ROOT/dist" "$ROOT/.payload"
+  rm -rf "$ROOT/.payload/Payload" && mkdir -p "$ROOT/.payload/Payload"
+  cp -r "$app" "$ROOT/.payload/Payload/"
+  ( cd "$ROOT/.payload" && zip -qr "$out" Payload )
+  ok "IPA: $out ($(du -h "$out" | cut -f1))"
+}
+
+# ---- 编译源码并产出 .ipa ----
+cmd_build() {
+  local src="${1:-}"; shift || true
+  local name="" bundle="com.example.app" minios="16.5" ent="" icon="" out=""
+  local -a frameworks=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --name) name="$2"; shift 2;;
+      --bundle-id) bundle="$2"; shift 2;;
+      --min-ios) minios="$2"; shift 2;;
+      --entitlements) ent="$2"; shift 2;;
+      --icon) icon="$2"; shift 2;;
+      --framework) frameworks+=("-framework" "$2"); shift 2;;
+      -o|--output) out="$2"; shift 2;;
+      *) die "未知参数: $1";;
+    esac
+  done
+  [ -n "$src" ] || die "用法: ./ipa build <源码目录> --name Xxx --bundle-id com.x.xx"
+  [ -d "$src" ] || die "源码目录不存在: $src"
+  [ -d "$SDK" ] || die "SDK 缺失，先跑 ./install.sh"
+  [ -n "$name" ] || name="$(basename "$src")"
+
+  local work="$ROOT/build/$name"
+  rm -rf "$work"; mkdir -p "$work/Payload/$name.app"
+
+  # 收集源码
+  local -a srcs=()
+  while IFS= read -r -d '' f; do srcs+=("$f"); done < <(find "$src" -maxdepth 2 -type f \( -name '*.m' -o -name '*.mm' -o -name '*.c' -o -name '*.cpp' \) -print0)
+  if [ ${#srcs[@]} -eq 0 ]; then
+    if find "$src" -maxdepth 2 -name '*.swift' | grep -q .; then
+      die "检测到 Swift 源码。Swift 需要 swiftc（Apple 官方工具链），当前环境不支持；请改用 Objective-C/C，或自行提供已编译的 .app 用 ./ipa pack"
+    fi
+    die "在 $src 里没找到 .m/.mm/.c/.cpp 源码"
+  fi
+
+  # 默认框架：源码里出现 UIKit 就链 UIKit + Foundation
+  if [ ${#frameworks[@]} -eq 0 ]; then
+    if grep -rqE '#import <UIKit/|#include <UIKit/' "$src" 2>/dev/null; then
+      frameworks=("-framework" "UIKit" "-framework" "Foundation")
+    else
+      frameworks=("-framework" "Foundation")
+    fi
+  fi
+
+  info "源码 ${#srcs[@]} 个，目标 arm64-apple-ios$minios"
+  local objc_flags=()
+  for f in "${srcs[@]}"; do case "$f" in *.m|*.mm) objc_flags=("-fobjc-arc");; esac; done
+  [ ${#objc_flags[@]} -gt 0 ] || objc_flags=()
+
+  clang -target "arm64-apple-ios${minios}" -isysroot "$SDK" \
+    -F "$SDK/System/Library/Frameworks" \
+    -fuse-ld=lld -O2 -fPIC "${objc_flags[@]}" \
+    "${frameworks[@]}" \
+    -o "$work/Payload/$name.app/$name" "${srcs[@]}" 2>&1 | tail -20
+  [ -f "$work/Payload/$name.app/$name" ] || die "编译失败（看上面的 clang 报错）"
+  ok "可执行文件: $(file -b "$work/Payload/$name.app/$name" | cut -c1-60)"
+
+  # Info.plist
+  sed -e "s|{{NAME}}|$name|g" -e "s|{{BUNDLE}}|$bundle|g" -e "s|{{MINIOS}}|$minios|g" \
+      "$ROOT/templates/Info.plist.in" > "$work/Payload/$name.app/Info.plist"
+
+  # 图标（可选）
+  if [ -n "$icon" ] && [ -f "$icon" ]; then
+    cp "$icon" "$work/Payload/$name.app/AppIcon60x60@2x.png"
+    /usr/bin/python3 - "$work/Payload/$name.app/Info.plist" <<'PY' 2>/dev/null || true
+import sys, plistlib
+p=sys.argv[1]
+d=plistlib.load(open(p,'rb'))
+d['CFBundleIcons']={'CFBundlePrimaryIcon':{'CFBundleIconFiles':['AppIcon60x60'],'CFBundleIconName':'AppIcon'}}
+d['CFBundleIcons~ipad']=d['CFBundleIcons']
+plistlib.dump(d,open(p,'wb'))
+PY
+  fi
+
+  # 签名
+  chmod +x "$work/Payload/$name.app/$name"
+  info "ldid 签名（伪签名，仅自用/越狱设备可装）"
+  if [ -n "$ent" ] && [ -f "$ent" ]; then
+    "$LDID" -S"$ent" "$work/Payload/$name.app/$name" || die "签名失败"
+  else
+    "$LDID" -S "$work/Payload/$name.app/$name" || die "签名失败"
+  fi
+  "$LDID" -h "$work/Payload/$name.app/$name" | head -4
+
+  # 打包
+  [ -n "$out" ] || out="$ROOT/dist/$name.ipa"
+  mkdir -p "$(dirname "$out")"
+  ( cd "$work" && zip -qr "$out" Payload )
+  ok "IPA: $out ($(du -h "$out" | cut -f1))"
+  unzip -l "$out" | tail -n +4 | head -8
+}
+
+case "${1:-}" in
+  doctor) shift; cmd_doctor "$@";;
+  install-sdk) shift; cmd_install_sdk "$@";;
+  build) shift; cmd_build "$@";;
+  pack) shift; cmd_pack "$@";;
+  ""|-h|--help|help)
+    sed -n '2,8p' "$0" | sed 's/^# /  /';;
+  *) die "未知命令: $1（可用: doctor / install-sdk / build / pack）";;
+esac
