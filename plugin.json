@@ -1,53 +1,26 @@
 {
   "name": "产出 IPA",
-  "id": "ipa-builder",
+  "id": "ipa-build",
   "version": "1.0.0",
-  "type": "toolchain-plugin",
-  "description": "安装即自动部署 iPhoneOS SDK + ldid，用户给源码就能编译出可安装的 .ipa",
-  "entry": "./ipa",
-  "install": "./install.sh",
-  "home": "$HOME/.ipa-toolchain",
-  "runtime": {
-    "os": "linux",
-    "arch": "x86_64",
-    "requires": ["clang", "ld64.lld", "zip", "g++", "make"]
-  },
-  "provides": {
-    "sdk": "iPhoneOS16.5.sdk",
-    "signer": "ldid 2.1.5 + zsign",
-    "packager": "zip/Payload"
-  },
-  "commands": [
-    {
-      "name": "doctor",
-      "usage": "./ipa doctor",
-      "description": "检查工具链是否完整"
-    },
-    {
-      "name": "install-sdk",
-      "usage": "./ipa install-sdk <iPhoneOS*.sdk.tar.xz>",
-      "description": "安装或替换 iOS SDK"
-    },
-    {
-      "name": "build",
-      "usage": "./ipa build <源码目录> --name 应用名 --bundle-id com.x.y [--min-ios 16.5] [--framework UIKit] [--entitlements plist] [--icon png] [-o 输出.ipa]",
-      "description": "编译 Objective-C/C 源码并产出签名后的 .ipa",
-      "output": "dist/<应用名>.ipa"
-    },
-    {
-      "name": "sign",
-      "usage": "./ipa sign <输入.ipa> --p12 证书.p12 --password 密码 --mobileprovision x.mobileprovision [-o 输出.ipa]  |  ./ipa sign <输入.ipa> --adhoc",
-      "description": "用 zsign 做证书签名或 ad-hoc 重签（证书路径需 p12 带完整 Apple 证书链）"
-    },
-    {
-      "name": "pack",
-      "usage": "./ipa pack <Xxx.app> [-o 输出.ipa]",
-      "description": "把已有 .app 目录打包成 .ipa"
-    }
+  "type": "skill",
+  "skill": "SKILL.md",
+  "setup": "scripts/bootstrap.sh",
+  "entry": "scripts/ipa",
+  "home": "~/.ipa-toolchain",
+  "capabilities": [
+    "arm64-apple-ios 交叉编译（clang 14 + ld64.lld）",
+    "iPhoneOS16.5 SDK 框架链接（.tbd stub）",
+    "ldid ad-hoc 伪签名",
+    "Payload/*.app -> .ipa 打包"
   ],
+  "commands": {
+    "doctor": "scripts/ipa doctor",
+    "build": "scripts/ipa build <源码目录> --name X --bundle-id com.x.y [--min-ios 14.0] [--framework UIKit] [--entitlements p.plist] [-o out.ipa]",
+    "pack": "scripts/ipa pack <Xxx.app> [-o out.ipa]"
+  },
   "limits": [
-    "仅支持 Objective-C / C / C++ 源码；Swift 需要 Apple 官方 swiftc，不在本插件范围",
-    "ldid 是伪签名，只能装到越狱设备或已信任的环境，不能上架 App Store",
-    "iPhoneOS SDK 版权归 Apple，请仅在你获授权的开发场景使用"
+    "不支持 Swift（需要 Apple swiftc）",
+    "ad-hoc 签名只能装越狱设备或 TrollStore，未越狱设备需开发者证书重签",
+    "不能用于上架 App Store"
   ]
 }

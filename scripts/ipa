@@ -1,0 +1,138 @@
+#!/usr/bin/env bash
+# 编 iOS 可执行文件，签名，打包成 ipa。
+
+set -e
+
+here="$(cd "$(dirname "$0")" && pwd)"
+tc="${IPA_HOME:-$HOME/.ipa-toolchain}"
+[ -f "$tc/env.sh" ] && . "$tc/env.sh"
+sdk="${IPA_SDK:-$tc/sdk/iPhoneOS16.5.sdk}"
+ldid="${IPA_LDID:-$tc/bin/ldid}"
+
+die() { echo "$*" >&2; exit 1; }
+
+case "$1" in
+
+doctor)
+  command -v clang    >/dev/null && echo "clang    $(clang --version|head -1|sed 's/.*version //')" || echo "clang    缺"
+  command -v ld64.lld >/dev/null && echo "ld64.lld ok" || echo "ld64.lld 缺"
+  [ -d "$sdk" ]  && echo "sdk      $sdk" || echo "sdk      缺"
+  [ -x "$ldid" ] && echo "ldid     $ldid" || echo "ldid     缺"
+  ;;
+
+build)
+  shift
+  src="$1"; shift || die "用法: ipa build 源码目录 --name App名 --bundle-id com.a.b"
+  [ -d "$src" ] || die "没有这个目录: $src"
+
+  name=""
+  bid="com.example.app"
+  minios="14.0"
+  ent=""
+  icon=""
+  out=""
+  fw=()
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --name)        name="$2"; shift 2;;
+      --bundle-id)   bid="$2"; shift 2;;
+      --min-ios)     minios="$2"; shift 2;;
+      --entitlements) ent="$2"; shift 2;;
+      --icon)        icon="$2"; shift 2;;
+      --framework)   fw+=("-framework" "$2"); shift 2;;
+      -o)            out="$2"; shift 2;;
+      *)             die "不认识的参数: $1";;
+    esac
+  done
+
+  [ -n "$name" ] || name="$(basename "$src")"
+  [ -n "$out" ] || out="$PWD/dist/$name.ipa"
+
+  work="$PWD/.ipa/$name"
+  rm -rf "$work"
+  app="$work/Payload/$name.app"
+  mkdir -p "$app"
+
+  files=()
+  while IFS= read -r f; do files+=("$f"); done < <(find "$src" -maxdepth 2 -type f \( -name '*.m' -o -name '*.mm' -o -name '*.c' -o -name '*.cpp' \))
+  [ ${#files[@]} -gt 0 ] || die "目录里没有 .m/.mm/.c/.cpp"
+
+  if [ ${#fw[@]} -eq 0 ]; then
+    grep -rq "UIKit/" "$src" 2>/dev/null && fw=(-framework UIKit -framework Foundation) || fw=(-framework Foundation)
+  fi
+
+  extra=()
+  for f in "${files[@]}"; do
+    case "$f" in *.m|*.mm) extra=(-fobjc-arc); break;; esac
+  done
+
+  echo "编 ${#files[@]} 个文件 -> arm64 ios$minios"
+  clang -target "arm64-apple-ios$minios" -isysroot "$sdk" \
+        -F "$sdk/System/Library/Frameworks" \
+        -fuse-ld=lld -O2 -fPIC "${extra[@]}" "${fw[@]}" \
+        -o "$app/$name" "${files[@]}"
+
+  # 顺手塞个 Info.plist 进去，不然装不上
+  cat > "$app/Info.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+	<key>CFBundleExecutable</key><string>$name</string>
+	<key>CFBundleIdentifier</key><string>$bid</string>
+	<key>CFBundleName</key><string>$name</string>
+	<key>CFBundlePackageType</key><string>APPL</string>
+	<key>CFBundleShortVersionString</key><string>1.0</string>
+	<key>CFBundleVersion</key><string>1</string>
+	<key>MinimumOSVersion</key><string>$minios</string>
+	<key>UIDeviceFamily</key><array><integer>1</integer><integer>2</integer></array>
+</dict></plist>
+PLIST
+
+  if [ -n "$icon" ] && [ -f "$icon" ]; then
+    cp "$icon" "$app/AppIcon60x60@2x.png"
+  fi
+
+  chmod +x "$app/$name"
+  if [ -n "$ent" ] && [ -f "$ent" ]; then
+    "$ldid" -S"$ent" "$app/$name" || die "ldid 签名失败"
+  else
+    "$ldid" -S "$app/$name" || die "ldid 签名失败"
+  fi
+
+  mkdir -p "$(dirname "$out")"
+  ( cd "$work" && zip -qr "$out" Payload )
+  echo "产物: $out"
+  unzip -l "$out" | sed -n '4,7p'
+  ;;
+
+pack)
+  shift
+  app="$1"; shift || die "用法: ipa pack 某.app [-o 输出.ipa]"
+  [ -d "$app" ] || die "没有这个目录: $app"
+  out=""
+  [ "${1:-}" = "-o" ] && out="$2"
+  nm="$(basename "$app" .app)"
+  [ -n "$out" ] || out="$PWD/dist/$nm.ipa"
+
+  exe="$app/$nm"
+  if [ ! -f "$exe" ]; then
+    exe="$(ls "$app" | head -1)"
+  fi
+  "$ldid" -S "$app/$(basename "$exe")" 2>/dev/null || true
+
+  tmp="$PWD/.ipa/pack"
+  rm -rf "$tmp"; mkdir -p "$tmp/Payload"
+  cp -r "$app" "$tmp/Payload/"
+  mkdir -p "$(dirname "$out")"
+  ( cd "$tmp" && zip -qr "$out" Payload )
+  echo "产物: $out"
+  ;;
+
+*)
+  sed -n '2p' "$0"
+  echo "  ipa doctor   看环境齐不齐"
+  echo "  ipa build    编译源码出 ipa"
+  echo "  ipa pack     已有的 .app 打成 ipa"
+  ;;
+esac
