@@ -33,13 +33,27 @@ function Ensure-Toolchain {
     # 没编译器的机器每次出包都重跑一遍 bootstrap
     $sdkDir = Join-Path $tc 'sdk/iPhoneOS16.5.sdk'
     if (Test-Path $sdkDir) { return }
-    Write-Host '工具链还没铺，先装一次（只装一次，之后走缓存）'
+    Write-Host '工具链还没铺，先装一次（SDK 和 zsign 从包里解，不联网）'
     $boot = Join-Path $here 'bootstrap.ps1'
     if (-not (Test-Path $boot)) { Die '找不到 scripts\bootstrap.ps1，插件不完整' }
-    & $boot
+    # 只铺打包要的：纯 pack / resign 不该为了编译器下 900MB 的 LLVM
+    & $boot -NoCompiler
     if (-not (Test-Path $sdkDir)) { Die '铺环境失败，看上面的报错' }
     # bootstrap 在子进程里改 PATH，回到这边就没了；env.ps1 是它写下的最终状态
     $envFile = Join-Path $tc 'env.ps1'
+    if (Test-Path $envFile) { . $envFile }
+}
+
+# build 才需要编译器，缺了就补一遍
+function Ensure-Build {
+    Ensure-Toolchain
+    $envFile = Join-Path $tc 'env.ps1'
+    if (Test-Path $envFile) { . $envFile }
+    $clang = Get-Command clang.exe -ErrorAction SilentlyContinue
+    if ($clang) { return }
+    Write-Host '编译器还缺，补一遍（要下载，几百兆）'
+    $boot = Join-Path $here 'bootstrap.ps1'
+    & $boot
     if (Test-Path $envFile) { . $envFile }
 }
 
@@ -656,7 +670,7 @@ function Cmd-Update([string]$mode) {
     Write-Host '换工具链'
     $old = $env:IPA_HOME
     $env:IPA_HOME = $tc
-    & (Join-Path $dir 'scripts/bootstrap.ps1')
+    & (Join-Path $dir 'scripts/bootstrap.ps1') -Force
     $env:IPA_HOME = $old
     if (-not (Test-Path (Join-Path $tc 'sdk/iPhoneOS16.5.sdk'))) { Die '工具链没换完，旧的那套还在，能继续用' }
     Set-Content -Path (Join-Path $tc 'VERSION') -Value $lat -Encoding UTF8
@@ -680,7 +694,7 @@ if ($args.Count -eq 0) {
 switch ($args[0]) {
     'doctor' { Cmd-Doctor }
     'info'   { if ($args.Count -gt 1) { Cmd-Info $args[1] } else { Cmd-Info $null } }
-    'build'  { Ensure-Toolchain; Cmd-Build @(Rest $args) }
+    'build'  { Ensure-Build; Cmd-Build @(Rest $args) }
     'pack'   { Ensure-Toolchain; Cmd-Pack @(Rest $args) }
     'resign' { Ensure-Toolchain; Cmd-Resign @(Rest $args) }
     'update' { Cmd-Update $(if ($args.Count -gt 1) { $args[1] } else { '' }) }

@@ -12,7 +12,11 @@ param(
     # 换机或换网络重下时若报对不上，先核对 size 981666720 与 tar 列表，再确认是不是上游换了包，别直接改这个数。
     # 待办：在一台干净 Windows 机上完整跑一次 bootstrap.ps1 复核这个锚点。
     # 换 URL 的话这个哈希也要跟着换，不然会被判成"文件不对"
-    [string]$LlvmSha = '22c5907db053026cc2a8ff96d21c0f642a90d24d66c23c6d28ee7b1d572b82e8'
+    [string]$LlvmSha = '22c5907db053026cc2a8ff96d21c0f642a90d24d66c23c6d28ee7b1d572b82e8',
+    # 强制重铺：先删旧的 SDK / zsign，不然下面“已存在就跳过”会让新版落不下来
+    [switch]$Force,
+    # 只铺打包要的东西，不装编译器。pack / resign 走这条，不该为打包下 900MB
+    [switch]$NoCompiler
 )
 
 $ErrorActionPreference = 'Stop'
@@ -21,6 +25,12 @@ $root = Split-Path -Parent $here
 if ($env:IPA_HOME) { $tc = $env:IPA_HOME }
 elseif ($env:USERPROFILE) { $tc = Join-Path $env:USERPROFILE '.ipa-toolchain' }
 else { $tc = Join-Path $HOME '.ipa-toolchain' }
+
+if ($Force) {
+    Write-Host '强制重铺：先删掉旧的 SDK / zsign'
+    Remove-Item (Join-Path $tc 'sdk/iPhoneOS16.5.sdk') -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item (Join-Path $tc 'bin/zsign.exe') -Force -ErrorAction SilentlyContinue
+}
 
 foreach ($d in @($tc, (Join-Path $tc 'bin'), (Join-Path $tc 'sdk'))) {
     New-Item -ItemType Directory -Path $d -Force | Out-Null
@@ -132,8 +142,11 @@ if (-not (Test-Path $zs)) {
     else { Write-Host "vendor 里没有 zsign.exe，签不了名" }
 }
 
-# 编译器：找得到就用，找不到就装上
-$bin = Find-Llvm
+# 编译器：找得到就用，找不到就装上；NoCompiler 时整段跳过
+$bin = if ($NoCompiler) { $null } else { Find-Llvm }
+if ($NoCompiler) {
+    Write-Host '只铺打包要的东西，跳过编译器（-NoCompiler）'
+} elseif ($bin) {
 if ($bin) {
     Write-Host "编译器在 $bin"
     Use-Path $bin

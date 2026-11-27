@@ -1,6 +1,6 @@
 ---
 name: dsh-ipa-build
-version: 1.4.3
+version: 1.4.4
 description: 把 iOS 程序做成 .ipa。源码能直接交叉编译成 arm64 包，现成的 .app 能打包，已有 ipa 能重签、改 bundle id 做多开，dylib 也跟着签。SDK、ldid、zsign 在包里，环境由 AI 自己铺。
 ---
 

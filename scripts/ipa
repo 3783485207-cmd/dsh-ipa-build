@@ -13,6 +13,20 @@ app_version() {
   sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' "$root/package.json" 2>/dev/null | head -1
 }
 
+# 从 npm 的 JSON 里取一个键。用 python3 解析，别拿贪婪 sed 去抢最后一个 version 字段。
+field() {
+  local key="$1"
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import json,sys
+d=json.load(sys.stdin)
+if "'"$key"'"=="tarball": print(d.get("dist",{}).get("tarball",""))
+elif "'"$key"'"=="integrity": print(d.get("dist",{}).get("integrity",""))
+else: print(d.get("'"$key"'",""))'
+  else
+    sed -n 's/.*"'"$key"'":"\([^"]*\)".*/\1/p' | head -1
+  fi
+}
+
 # 只判断 a 是否比 b 旧，输出 1/0。不用 sort -V：macOS 的 sort 没有这个开关。
 version_lt() {
   awk -v a="$1" -v b="$2" 'BEGIN{
@@ -23,15 +37,29 @@ version_lt() {
   }'
 }
 
-# 工具链没铺过就自己铺，不等用户跑 bootstrap。SDK/ldid/zsign 全在 vendor 里，不联网；
-# 编译器那一步要联网或要 sudo，失败会让 bootstrap 自己报，不在这里吞掉。
-ensure_toolchain() {
-  [ -d "$sdk" ] && [ -x "$ldid" ] && [ -f "$tc/env.sh" ] && return 0
-  echo "工具链还没铺，先装一次（只装一次，之后走缓存）" >&2
-  bash "$root/scripts/bootstrap.sh" >&2 || die "铺环境失败，见上面的报错"
+# 铺环境分两档：打包/签名只要有 SDK，build 才要编译器。
+# 以前一律按全量装，Linux 没 sudo 的机器连 pack 都会被 apt 拖死，macOS 上跑一次 pack
+# 还会弹 Xcode 命令行工具的框，纯属不该发生。
+reload_env() {
   [ -f "$tc/env.sh" ] && . "$tc/env.sh"
   sdk="${IPA_SDK:-$tc/sdk/iPhoneOS16.5.sdk}"
   ldid="${IPA_LDID:-$tc/bin/ldid}"
+}
+
+ensure_base() {
+  [ -d "$sdk" ] && [ -f "$tc/env.sh" ] && return 0
+  echo "工具链还没铺，先装一次（SDK 和 zsign 从包里解，不联网）" >&2
+  IPA_NO_COMPILER=1 bash "$root/scripts/bootstrap.sh" >&2 || die "铺环境失败，见上面的报错"
+  reload_env
+}
+
+ensure_toolchain() {
+  ensure_base
+  command -v clang >/dev/null 2>&1 && [ -x "$ldid" ] && return 0
+  echo "编译器或 ldid 还缺，补一遍（这一步可能要 sudo 或者下载）" >&2
+  bash "$root/scripts/bootstrap.sh" >&2 || true
+  reload_env
+  command -v clang >/dev/null 2>&1 || die "没有 clang。跑 scripts/bootstrap.sh 装（Linux 走 apt，macOS 走 xcode-select + brew），装完再编"
 }
 
 die() { echo "$*" >&2; exit 1; }
@@ -459,9 +487,13 @@ cmd_pack() {
   fi
   [ -z "$out" ] && out="$PWD/dist/${name:-$(basename "$app" .app)}.ipa"
 
-  if [ -z "$p12" ] && [ -f "$app/$exe" ] && [ -x "$ldid" ]; then
-    rm -rf "$app/_CodeSignature"
-    "$ldid" -S "$app/$exe" || echo "签名没成功，包还是打出来，装不装得上另说"
+  if [ -z "$p12" ] && [ -f "$app/$exe" ]; then
+    if [ -x "$ldid" ]; then
+      rm -rf "$app/_CodeSignature"
+      "$ldid" -S "$app/$exe" || echo "签名没成功，包还是打出来，装不装得上另说"
+    else
+      echo "这台机器上没有 ldid，包是没签名打出来的。编译器装好后 run 一遍 bootstrap 再 resign 一下就有签名了" >&2
+    fi
   fi
 
   local tmpipa="$out.tmp.ipa"
@@ -475,7 +507,9 @@ cmd_pack() {
 # 内嵌的 framework / appex / dylib 都得签，只签主程序启动就崩
 sign_nested() {
   local app="$1" ent="$2" d
-  if [ -d "$app/PlugIns" ]; then
+  # 老式 watchOS 布局把扩展放在 Watch/X.app/PlugIns 下，主 app 根目录没有 PlugIns，
+  # 按目录判断会把这种包整个跳过。直接全树找 .appex。
+  if true; then
     while IFS= read -r x; do
       local xe; xe="$(plist_get "$x" CFBundleExecutable)"
       [ -n "$xe" ] || xe="$(basename "$x" .appex)"
@@ -490,6 +524,13 @@ sign_nested() {
       find "$x" -name '*.dylib' -type f | while read -r d; do "$ldid" -S "$d" || true; done
     done < <(find "$app" -name '*.appex' -type d -not -path '*/Frameworks/*' 2>/dev/null)
   fi
+  # 内层 .app（比如 Watch 的 watchkitapp）自己的主可执行文件同样得签
+  while IFS= read -r sub; do
+    local se; se="$(plist_get "$sub" CFBundleExecutable)"
+    [ -n "$se" ] || se="$(basename "$sub" .app)"
+    [ -f "$sub/$se" ] && { "$ldid" -S "$sub/$se" || die "签 $sub/$se 失败"; }
+  done < <(find "$app" -mindepth 2 -name '*.app' -type d 2>/dev/null)
+
   if [ -d "$app/Frameworks" ]; then
     while IFS= read -r fwdir; do
       local bin="$fwdir/$(basename "$fwdir" .framework)"
@@ -588,7 +629,7 @@ cmd_update() {
   command -v curl >/dev/null 2>&1 || die "没有 curl，查不了新版"
   local meta
   meta="$(curl -fsSL --max-time 20 https://registry.npmjs.org/dsh-ipa-build/latest)" || die "查 npm 没通，网络问题，稍后再试"
-  lat="$(printf '%s' "$meta" | sed -n 's/.*"version":"\([^"]*\)".*/\1/p' | head -1)"
+  lat="$(printf '%s' "$meta" | field version)"
   [ -n "$lat" ] || die "npm 的返回里解析不出版本号"
   echo "插件 $cur，npm 上 $lat"
   if [ "$cur" = "$lat" ]; then echo "已经是最新"; return 0; fi
@@ -603,8 +644,8 @@ cmd_update() {
   fi
 
   local url integ
-  url="$(printf '%s' "$meta" | sed -n 's/.*"tarball":"\([^"]*\)".*/\1/p' | head -1)"
-  integ="$(printf '%s' "$meta" | sed -n 's/.*"integrity":"\([^"]*\)".*/\1/p' | head -1)"
+  url="$(printf '%s' "$meta" | field tarball)"
+  integ="$(printf '%s' "$meta" | field integrity)"
   [ -n "$url" ] || die "npm 没给 tarball 地址"
   local tgz="$tc/dsh-ipa-build-$lat.tgz"
   mkdir -p "$tc"
@@ -623,8 +664,8 @@ cmd_update() {
   local dir="$tc/pkg/$lat"
   rm -rf "$dir"; mkdir -p "$dir"
   tar -xzf "$tgz" -C "$dir" --strip-components=1 || die "解包失败"
-  echo "换工具链"
-  IPA_HOME="$tc" bash "$dir/scripts/bootstrap.sh" || die "工具链没换完，旧的那套还在，能继续用"
+  echo "换工具链（先删旧的再铺，不然 bootstrap 的“已存在就跳过”会让新版落不下来）"
+  IPA_HOME="$tc" IPA_FORCE=1 bash "$dir/scripts/bootstrap.sh" || die "工具链没换完，旧的那套还在，能继续用"
   printf '%s\n' "$lat" > "$tc/VERSION"
   rm -f "$tgz"
   echo "工具链已到 $lat"
@@ -635,8 +676,8 @@ case "${1:-}" in
   doctor) cmd_doctor;;
   info) shift; cmd_info "$@";;
   build) ensure_toolchain; cmd_build "$@";;
-  pack) ensure_toolchain; cmd_pack "$@";;
-  resign) ensure_toolchain; cmd_resign "$@";;
+  pack) ensure_base; cmd_pack "$@";;
+  resign) ensure_base; cmd_resign "$@";;
   update) shift; cmd_update "$@";;
   *) sed -n '2p' "$0"; echo; echo "  doctor   看环境齐不齐"
      echo "  info     看 ipa/app 的标识、版本、架构、签没签"
