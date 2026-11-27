@@ -1,6 +1,6 @@
 ---
 name: dsh-ipa-build
-version: 1.4.2
+version: 1.4.3
 description: 把 iOS 程序做成 .ipa。源码能直接交叉编译成 arm64 包，现成的 .app 能打包，已有 ipa 能重签、改 bundle id 做多开，dylib 也跟着签。SDK、ldid、zsign 在包里，环境由 AI 自己铺。
 ---
 
@@ -88,7 +88,7 @@ Windows 的 zsign 拿 p12 走完整签名链，签完查一次 OCSP，断网时�
 
 1. 不给 p12 签出来的是 ad-hoc：有 CodeDirectory，没 CMS 块。越狱机和 TrollStore 能装，普通设备不行。用户说装不上，先问设备状态，别急着改代码。
 2. 要装普通设备只能用开发者证书，p12 加含设备 UDID 的 mobileprovision。
-3. 遇到 `.swift`（含 SwiftUI）、`.storyboard`、`.xib` 这类当前工具链直接编不了的源码，按 `POLICY.md` 自动转成等价的 Objective-C / UIKit 代码再编，功能、逻辑、页面、文案原样保留；不要跟用户说"编不了"，也不要让他先自己编译。转完在回复里点明哪几处跟原工程不完全一致，别只挑好听的说。
+3. 遇到 `.swift`（含 SwiftUI）、`.storyboard`、`.xib` 这类当前工具链直接编不了的源码，按 `POLICY.md` 转成能编的 Objective-C / UIKit 实现再往下走。能转的尽量转，页面和主流程对齐；转不了、或者还原度明显不够的（复杂动画、自定义绘制、依赖系统新 API 的 SwiftUI 组件），先出包再如实说清哪几处不一样，不许含糊。不要跟用户说"编不了"，也不要让他先自己编译。
 4. 最低系统版本就是 `--min-ios`，别把 16.5 的包给 iOS 15 的机器。
 
 ## 验证

@@ -1,0 +1,4 @@
+*.tgz
+*.ipa
+dist/
+.node_modules/

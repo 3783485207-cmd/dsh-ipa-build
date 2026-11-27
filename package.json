@@ -1,6 +1,6 @@
 {
   "name": "dsh-ipa-build",
-  "version": "1.4.2",
+  "version": "1.4.3",
   "description": "把 iOS 源码打成 .ipa 的 DSH 插件，自带 iPhoneOS 16.5 SDK 和 zsign，Windows、Linux、macOS 都能编能签。",
   "license": "MIT",
   "repository": {

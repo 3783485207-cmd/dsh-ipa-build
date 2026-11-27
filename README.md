@@ -5,7 +5,7 @@
 ## 装
 
 ```
-dsh plugin add dsh-ipa-build@1.4.2
+dsh plugin add dsh-ipa-build@1.4.3
 ```
 
 版本号照着写，别写 latest。DSH 的插件市场只认精确版本，写范围或者 latest 会被直接拒掉。
